@@ -1,0 +1,7 @@
+.idea/
+.venv/
+__pycache__/
+*.o
+*.obj
+*.exe
+build/
