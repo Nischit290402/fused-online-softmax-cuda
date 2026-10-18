@@ -56,8 +56,8 @@ def main():
     total = 0
     failed = 0
 
-    print("\n=== fast_exp=False: 8 cases x variant {0,1} x block {128,256,512,1024} ===")
-    for variant in (0, 1):
+    print("\n=== fast_exp=False: 8 cases x variant {0,1,2} x block {128,256,512,1024} ===")
+    for variant in (0, 1, 2):
         for block in (128, 256, 512, 1024):
             for name, make, check in CASES:
                 x = make()
@@ -71,7 +71,7 @@ def main():
     print(f"{total - failed}/{total} checks passed")
 
     print("\n=== fast_exp=True: cases 3 and 4 (block 256) ===")
-    for variant in (0, 1):
+    for variant in (0, 1, 2):
         for name, make, check in (CASES[2], CASES[3]):
             x = make()
             y = m.forward(x, variant, 256, True)
@@ -80,10 +80,21 @@ def main():
             print(f"variant={variant} case {name}: max_abs_err={r['max_abs_err']:.3e} "
                   f"max_row_sum_dev={r['max_row_sum_dev']:.3e}")
 
+    print("\n=== variant 2 with a row that does not fit in shared memory ===")
+    limit = m.max_smem_optin()
+    too_big = torch.zeros(1, limit // 2 + 1, dtype=torch.float16, device='cuda')
+    try:
+        m.forward(too_big, 2, 256, False)
+        print("FAIL: no error for a row larger than shared memory")
+        failed += 1
+    except RuntimeError as e:
+        print(f"ok, max_smem_optin={limit}, raised: {str(e).splitlines()[0]}")
+
     print("\n=== timing, make_input(4096) ===")
     x = make_input(4096)
     print("B1 (variant 0)  ", bench(lambda t: m.forward(t, 0, 256, False), x))
     print("B2 (variant 1)  ", bench(lambda t: m.forward(t, 1, 256, False), x))
+    print("B3 (variant 2)  ", bench(lambda t: m.forward(t, 2, 256, False), x))
     print("composed        ", bench(softmax_composed, x))
     print("torch.softmax   ", bench(softmax_torch, x))
 

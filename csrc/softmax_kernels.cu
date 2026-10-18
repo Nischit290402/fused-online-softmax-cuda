@@ -168,48 +168,90 @@ template <bool FAST_EXP> __global__ void softmax_b2_kernel(const __half* x, __ha
 
 }  // 2 passes
 
-template <bool FAST_EXP> __global__ void softmax_b3_kernel(const __half* x, __half* y, int64_t N);  // 1 pass, optional
+template <bool FAST_EXP> __global__ void softmax_b3_kernel(const __half* x, __half* y, int64_t N) {
+    extern __shared__ __half row[];
+    int64_t offset = blockIdx.x * N;
+    int64_t s = blockDim.x;
+    __shared__ float2 smem[32];
+    float2 md = make_float2(-INFINITY,0.0f);
+
+    for (int64_t j = threadIdx.x; j < N; j += s) {
+        __half h = x[offset + j];
+        row[j] = h;
+        md = md_combine<FAST_EXP>(make_float2(__half2float(h), 1.0f), md);
+    }
+    md = block_reduce_md<FAST_EXP>(md, smem);
+
+    if (md.x == -INFINITY) {               // all -inf row: write zeros, same rule as B1 and B2
+        for (int64_t j = threadIdx.x; j < N; j += s) {
+            y[offset + j] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    // second pass reads shared memory, not DRAM
+    for (int64_t j = threadIdx.x; j < N; j += s) {
+        y[offset + j] = __float2half(exp_f<FAST_EXP>(__half2float(row[j]) - md.x) / md.y);
+    }
+}  // 1 pass, optional
+
+int64_t max_smem_optin();   // defined at the end of the file, used by softmax_forward below
 
 // ---- called from Python ----
 torch::Tensor softmax_forward(torch::Tensor x, int64_t variant, int64_t block, bool fast_exp) {
-    // 1 check: x is CUDA, Half, contiguous, 2-D
-    // 2 y = at::empty_like(x); rows = x.size(0); N = x.size(1)
-    // 3 stream = at::cuda::getCurrentCUDAStream()
-    // 4 launch kernel<<<rows, block, smem_bytes, stream>>>(...) chosen by variant and fast_exp
-    // 5 C10_CUDA_KERNEL_LAUNCH_CHECK(); return y
-    if (variant == 0 || variant == 1) {
-        CHECK_INPUT(x, at::kHalf);
-        TORCH_CHECK(x.dim() == 2, "x must be 2-D (rows, N)");
-        TORCH_CHECK(block > 0 && block <= 1024 && block % 32 == 0,
-                    "block must be a multiple of 32 and at most 1024");
-        torch::Tensor y = torch::empty_like(x);
-        int64_t rows = x.size(0);
-        int64_t N = x.size(1);
-        TORCH_CHECK(N > 0, "N must be positive");
-        if (rows == 0) return y;
+    TORCH_CHECK(variant >= 0 && variant <= 2, "variant must be 0, 1 or 2");
+    CHECK_INPUT(x, at::kHalf);
+    TORCH_CHECK(x.dim() == 2, "x must be 2-D (rows, N)");
+    TORCH_CHECK(block > 0 && block <= 1024 && block % 32 == 0,
+                "block must be a multiple of 32 and at most 1024");
+    torch::Tensor y = torch::empty_like(x);
+    int64_t rows = x.size(0);
+    int64_t N = x.size(1);
+    TORCH_CHECK(N > 0, "N must be positive");
+    if (rows == 0) return y;
 
-        auto stream = at::cuda::getCurrentCUDAStream();
-        const __half* x_ptr = reinterpret_cast<const __half*>(x.data_ptr<at::Half>());
-        __half* y_ptr = reinterpret_cast<__half*>(y.data_ptr<at::Half>());
-        dim3 grid(static_cast<unsigned int>(rows));
-        dim3 blk(static_cast<unsigned int>(block));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const __half* x_ptr = reinterpret_cast<const __half*>(x.data_ptr<at::Half>());
+    __half* y_ptr = reinterpret_cast<__half*>(y.data_ptr<at::Half>());
+    dim3 grid(static_cast<unsigned int>(rows));
+    dim3 blk(static_cast<unsigned int>(block));
 
-        if (variant == 0) {
-            if (fast_exp) {
-                softmax_b1_kernel<true><<<grid, blk, 0, stream>>>(x_ptr, y_ptr, N);
-            } else {
-                softmax_b1_kernel<false><<<grid, blk, 0, stream>>>(x_ptr, y_ptr, N);
-            }
+    if (variant == 0) {
+        if (fast_exp) {
+            softmax_b1_kernel<true><<<grid, blk, 0, stream>>>(x_ptr, y_ptr, N);
         } else {
-            if (fast_exp) {
-                softmax_b2_kernel<true><<<grid, blk, 0, stream>>>(x_ptr, y_ptr, N);
-            } else {
-                softmax_b2_kernel<false><<<grid, blk, 0, stream>>>(x_ptr, y_ptr, N);
-            }
+            softmax_b1_kernel<false><<<grid, blk, 0, stream>>>(x_ptr, y_ptr, N);
         }
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        return y;
+    } else if (variant == 1) {
+        if (fast_exp) {
+            softmax_b2_kernel<true><<<grid, blk, 0, stream>>>(x_ptr, y_ptr, N);
+        } else {
+            softmax_b2_kernel<false><<<grid, blk, 0, stream>>>(x_ptr, y_ptr, N);
+        }
+    } else {
+        int64_t bytes = N * static_cast<int64_t>(sizeof(__half));      // the row
+        int64_t scratch = 32 * static_cast<int64_t>(sizeof(float2));   // smem[32] inside the kernel
+        TORCH_CHECK(bytes + scratch <= max_smem_optin(),
+                    "variant 2: row does not fit in shared memory");
+        if (fast_exp) {
+            if (bytes > 48 * 1024)
+                C10_CUDA_CHECK(cudaFuncSetAttribute(softmax_b3_kernel<true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
+            softmax_b3_kernel<true><<<grid, blk, bytes, stream>>>(x_ptr, y_ptr, N);
+        } else {
+            if (bytes > 48 * 1024)
+                C10_CUDA_CHECK(cudaFuncSetAttribute(softmax_b3_kernel<false>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
+            softmax_b3_kernel<false><<<grid, blk, bytes, stream>>>(x_ptr, y_ptr, N);
+        }
     }
-    return x;
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
 }
-int64_t max_smem_optin() { return 0; }   // cudaDeviceGetAttribute(..., cudaDevAttrMaxSharedMemoryPerBlockOptin, dev)
+int64_t max_smem_optin() {
+    int dev;
+    cudaGetDevice(&dev);
+    int v;
+    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    return v;
+}

@@ -10,7 +10,8 @@ from torch.profiler import profile, ProfilerActivity
 import ext
 from softmax import bench, make_input, softmax_composed, softmax_torch
 
-HAVE_B3 = False          # set True once variant 2 (B3) is built and tested
+HAVE_B3 = True           # variant 2 (B3) is built; rows where the row does not fit get skip_smem
+SCRATCH_BYTES = 32 * 8   # float2 smem[32] inside the fused kernels
 SIZES = [1024, 2048, 4096, 8192, 16384, 32768]
 
 HEADERS = ['variant', 'S', 'block', 'exp_impl',
@@ -60,6 +61,7 @@ def warm_up_gpu(seconds: float = 6.0) -> None:
     # The GPU idles at 300 MHz and needs about 5 s of load to reach its working clocks.
     # Run softmax for a few seconds so the first timed cell does not run during the ramp-up.
     x = make_input(8192, 0)
+    count_kernels(softmax_torch, x)      # start torch.profiler now so its set-up does not stall a timed cell
     t_end = time.time() + seconds
     while time.time() < t_end:
         for _ in range(20):
@@ -68,6 +70,15 @@ def warm_up_gpu(seconds: float = 6.0) -> None:
     del x
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def spin(fn, x, seconds: float) -> None:
+    # keep the GPU busy with fn for a moment so the clocks are settled before timing
+    t_end = time.time() + seconds
+    while time.time() < t_end:
+        for _ in range(20):
+            fn(x)
+        torch.cuda.synchronize()
 
 
 def effective_bw_GBps(S: int, t_median_us: float) -> float:
@@ -82,6 +93,9 @@ def run_cell(m, cell: dict) -> dict:
     row = {h: '' for h in HEADERS}
     row.update(cell)
     row['status'] = 'ok'
+    if cell['variant'] == 'B3' and 2 * cell['S'] + SCRATCH_BYTES > m.max_smem_optin():
+        row['status'] = 'skip_smem'
+        return row
     x = None
     try:
         x = make_input(cell['S'], 0)
@@ -89,6 +103,8 @@ def run_cell(m, cell: dict) -> dict:
         row['kernels_per_call'] = count_kernels(fn, x)
         # small S means calls of 60 to 600 us, so use more warm-up and more timed runs
         warmup, iters = (50, 200) if cell['S'] <= 4096 else (10, 50)
+        if cell['S'] <= 4096:
+            spin(fn, x, 0.5)
         row.update(bench(fn, x, warmup=warmup, iters=iters))
         row['eff_bw_GBps'] = effective_bw_GBps(cell['S'], row['t_median_us'])
     except torch.cuda.OutOfMemoryError:
