@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/Fused Online Softmax in CUDA.iml" filepath="$PROJECT_DIR$/.idea/Fused Online Softmax in CUDA.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/Fused_Online_Softmax_in_CUDA.iml" filepath="$PROJECT_DIR$/.idea/Fused_Online_Softmax_in_CUDA.iml" />
     </modules>
   </component>
 </project>
