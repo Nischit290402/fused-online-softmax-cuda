@@ -106,10 +106,24 @@ def fig_block(cells):
     plt.close(fig)
 
 
+V2 = ['B3v2', 'B4', 'B5']
+
+
+def ncu_v2():
+    out = {}
+    for v in V2:
+        for S in (8192, 16384):
+            p = ncu_path(os.path.join('results', 'v2'), v, S)
+            if os.path.exists(p):
+                out[(v, S)] = parse_ncu_csv(p)
+    return out
+
+
 def fig_limiters(ncu):
+    ncu = {**ncu, **ncu_v2()}
     fig, ax = plt.subplots(figsize=(8.5, 5.2), dpi=150, facecolor=SURFACE)
     _style(ax)
-    for v in ALL:
+    for v in ALL + V2:
         for S, ms in ((8192, 9), (16384, 13)):
             if (v, S) not in ncu:
                 continue
@@ -117,7 +131,9 @@ def fig_limiters(ncu):
             ax.plot([d['dram_pct_peak']], [d['sm_pct_peak']], marker=MARKERS[v], ms=ms, color=COLORS[v],
                     markeredgecolor=SURFACE, markeredgewidth=1.5, ls='none',
                     label=v if S == 8192 else None)
-            off = {('B3', 8192): (-8, 6, 'right'), ('torch.softmax', 8192): (8, 4, 'left')}.get((v, S), (9, -3, 'left'))
+            off = {('B3', 8192): (-8, 6, 'right'), ('torch.softmax', 8192): (8, 4, 'left'),
+                   ('B4', 16384): (-9, -3, 'right'), ('B5', 8192): (-9, -3, 'right'),
+                   ('B3v2', 8192): (-9, 5, 'right')}.get((v, S), (9, -3, 'left'))
             ax.annotate(f"{v} {S // 1024}K, occ {d['occupancy_pct']:.0f}%", (d['dram_pct_peak'], d['sm_pct_peak']),
                         xytext=off[:2], textcoords='offset points', fontsize=7.5, color=INK2, ha=off[2])
     ax.plot([0, 100], [0, 100], color=MUTED, lw=0.8, ls=':')
@@ -125,9 +141,9 @@ def fig_limiters(ncu):
     ax.set_ylim(0, 100)
     ax.set_xlabel('DRAM throughput, % of peak (ncu)')
     ax.set_ylabel('SM throughput, % of peak (ncu)')
-    ax.set_title('No kernel is close to either roof: latency and occupancy set the time', loc='left', fontsize=11, color=INK)
+    ax.set_title('v1 kernels wait on memory latency; v2 B4 and B5 reach 81-94% of DRAM peak', loc='left', fontsize=11, color=INK)
     ax.text(97, 4, 'near x = 100: DRAM-bound\nnear y = 100: SM-bound', ha='right', va='bottom', fontsize=8, color=MUTED)
-    ax.legend(frameon=False, fontsize=8.5, labelcolor=INK2, loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=5)
+    ax.legend(frameon=False, fontsize=8.5, labelcolor=INK2, loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=4)
     fig.savefig('results/graph5_limiters.png', facecolor=SURFACE, bbox_inches='tight')
     plt.close(fig)
 

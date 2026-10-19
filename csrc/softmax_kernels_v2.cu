@@ -4,6 +4,7 @@
 //   B3 launch: the block is widened until the blocks that fit in shared memory fill the SM.
 //   B4 (variant 3): B2's two passes with 16-byte loads, one (m, d) rescale per 8 values, exp2, reciprocal.
 //   B5 (variant 4): B4's math with one warp per row (shuffles only, no shared memory, no __syncthreads).
+// Study notes with worked numbers are at the end of this file.
 #include <torch/types.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
@@ -420,3 +421,106 @@ int64_t b3_block(int64_t N, int64_t block) {
     const int64_t wide = (std::min<int64_t>(1024, threads_per_sm) / fit) / 32 * 32;
     return std::min<int64_t>(1024, std::max<int64_t>(block, wide));
 }
+
+/* =====================================================================================================
+   STUDY NOTES FOR VERSION 2 (read these when you come back to this file)
+   =====================================================================================================
+
+   0. Map of this file
+      B1 (variant 0), B2 (variant 1), B3 kernel (variant 2): copied unchanged from v1, written by hand.
+      B3 launch: b3_block() at the end widens the block.                          See note 6.
+      B4 (variant 3): softmax_b4_kernel = row_md + block_reduce_md + write_row.   See notes 1 to 5.
+      B5 (variant 4): softmax_b5_kernel = row_md + warp_reduce_md + write_row.    See note 7.
+      Helpers in order: exp_f (base e or base 2), md_combine / warp_reduce_md / block_reduce_md
+      (BASE2 template flag), unpack8 / pack8, chunk_md, row_md, write_row.
+
+   1. Why B4 loads 8 values at a time (uint4 = 16 bytes)
+      v1 kernels read one __half per thread per load: a warp load moves 32 x 2 = 64 bytes.
+      B4 reads one uint4 per thread: a warp load moves 32 x 16 = 512 bytes, 8x more per instruction.
+      Nsight showed B1/B2 stalled on long_scoreboard (waiting for global loads), with DRAM only 25-41%
+      busy. That means too few bytes were in flight. More bytes per load instruction is the direct fix.
+      torch.softmax does the same: the 8 in cunn_SoftMaxForwardReg<..., 8> is 8 halves per load.
+
+   2. chunk_md: one rescale per 8 values instead of one per value
+      B2 folds every value into (m, d) through md_combine, which calls exp twice:
+          d = d_a * e^(m_a - m) + d_b * e^(m_b - m)      -> 2 exps per value
+      chunk_md first finds the chunk max cm, then sums 8 exps against cm, then merges the chunk once:
+          8 exps + 2 exps (one md_combine) per 8 values  -> 1.25 exps per value
+      This is the per-tile step of FlashAttention: tile max, exp of the tile, one rescale per tile.
+      Worked example, base e for readability, two chunks seen by one thread:
+          chunk A = [1, 3, 2, ...]  -> cm = 3, d = e^(1-3) + e^(3-3) + e^(2-3) + ...
+          chunk B = [5, 0, 4, ...]  -> cm = 5, d = e^(5-5) + e^(0-5) + e^(4-5) + ...
+          merge:  m = 5, d = d_A * e^(3-5) + d_B * e^(5-5)
+      The result equals the one-value-at-a-time result exactly (in real arithmetic); only the number of
+      exps changes. Masked chunk (all -inf): chunk_md returns (-inf, 0), md_combine skips it.
+
+   3. Why the log2 domain (exp2 instead of exp)
+      The GPU's special-function unit computes 2^x (instruction MUFU.EX2). e^x is rewritten as
+          e^x = 2^(x * log2(e)),    log2(e) = 1.4426950408889634
+      expf adds range-reduction instructions around that EX2. B4/B5 multiply every input by log2(e) once
+      (in chunk_md, or in the scalar fallback), keep m in log2 units, and call 2^t directly.
+      In write_row, x * log2(e) - m is a single fmaf (one FFMA instruction), then EX2, then one multiply.
+      FlashAttention-2 does the same: it folds log2(e) into the softmax scale.
+      Fast path: ex2.approx.ftz.f32 via inline PTX (what __expf uses internally). Accurate path: exp2f.
+
+   4. Why multiply by 1/d instead of dividing by d
+      Without --use_fast_math, fp32 division is IEEE-correct and costs several instructions per value.
+      inv_d = 1.0f / md.y is computed once per row; each value then needs one FMUL.
+      The difference is at most about 1 fp32 ulp (relative 2^-23), far below fp16 output rounding
+      (relative 2^-11), so the fp16 result is the same in practice.
+
+   5. When the 16-byte path is used (vec)
+      vec = (N % 8 == 0) and x_ptr, y_ptr both 16-byte aligned. Every row then starts on a 16-byte
+      boundary, because row r starts at r * N * 2 bytes and N * 2 is a multiple of 16.
+      Otherwise the kernels take the scalar loop (one __half per thread, md_combine per value).
+      Example of an unaligned but contiguous input: buf = randn(4 * 4096 + 1); x = buf[1:].view(4, 4096).
+      x starts 2 bytes past an aligned address, so vec is false. tests/test_ext_v2.py covers this case.
+
+   6. B3: why the launch widens the block (b3_block)
+      B3 keeps the whole row in shared memory: 2 * N bytes + 256 bytes of reduction scratch per block.
+      RTX 2070 Max-Q (sm_75): 64 KiB shared memory and 1,024 threads per SM.
+          S = 16384: 32,768 + 256 = 33,024 B per block -> 1 block per SM fits.
+                     v1 launched 256 threads = 8 warps of 32 possible -> 25% occupancy (ncu measured 25%).
+                     b3_block: 1024 / 1 = 1024 threads -> 32 warps -> 100%.
+          S = 8192:  16,640 B per block -> 3 blocks fit (4 x 16,640 > 65,536).
+                     v1: 3 x 8 warps = 24 of 32 = 75% (ncu measured 74%).
+                     b3_block: 1024 / 3 = 341 -> rounded down to 320 (a multiple of 32) -> 3 x 10 = 30 warps.
+          S <= 4096: the requested block already fills the SM, so nothing changes.
+      torch.softmax's cunn_SoftMaxForwardSmem runs 1,024 threads per block at S = 16384 for this reason.
+      B3's kernel is unchanged. Each thread still re-reads only the row[j] values it wrote itself, so the
+      second loop needs no extra __syncthreads.
+
+   7. B5: one warp per row
+      B1 to B4 split one row across 8 warps, so each reduction needs shared memory and two __syncthreads.
+      B5 gives each row to one warp: 32 lanes stride over the row, then warp_reduce_md (5 shuffles,
+      offsets 16, 8, 4, 2, 1) leaves the result in every lane. No shared memory, no block barrier.
+      Launch: block / 32 rows per block (block 256 -> 8 rows per block), grid = ceil(rows / 8).
+      `if (row >= rows) return;` is safe: row is the same for all 32 lanes of a warp, so the whole warp
+      exits together, and there is no __syncthreads anywhere in the kernel that it could skip.
+      Expected: helps short rows (S <= 2048, where torch's softmax_warp_forward beat B1: 92 us vs 147 us
+      under ncu). Long rows (16384) give one warp a lot of serial work, so B4 should win there.
+      FlashAttention-2 uses the same idea: rows go to warps, instead of splitting one row's reduction
+      across warps.
+
+   8. Edge cases (same rules as v1)
+      All -inf row: block (or warp) result m = -inf, write_row writes zeros. Lab convention;
+      torch.softmax returns NaN. The branch is uniform: every thread of the block (B4) or warp (B5)
+      holds the same reduced md.
+      Masked values inside a row: 2^(-inf - m) = 0, so they get probability 0.
+      NaN: fmaxf skips NaN, but the NaN reaches the sum, so the row comes out NaN.
+
+   9. What FlashAttention does that this file still does not
+      * It fuses QK^T, softmax and PV, so S and P never reach DRAM. Here S is read from DRAM and P is
+        written back: 4 bytes per element at best.
+      * It keeps O unnormalized and divides by l once at the end. Here the output is P itself, so a
+        second read of x (B4, B5) or an on-chip copy of the row (B3) is unavoidable.
+      * It stores logsumexp = m + log(l) per row for the backward pass. Not done here.
+
+   10. Check yourself (answers are in the notes above)
+      Q: B2 calls exp how many times per value in pass 1? B4?             (2; 1.25)
+      Q: Why does B3 at S = 8192 launch 320 threads and not 341?          (multiple of 32 = whole warps)
+      Q: Why is B5's early return safe without a barrier?                  (uniform per warp, no __syncthreads)
+      Q: What makes vec false for a contiguous tensor?                     (N % 8 != 0 or a 16-B misalignment)
+      Q: Why fmaf(x, log2e, -m) instead of (x - m) * log2e?                (one FFMA; m is already in log2 units)
+      Q: Which Nsight metric showed the load problem in v1?                (long_scoreboard stalls, DRAM 25-41%)
+   ===================================================================================================== */

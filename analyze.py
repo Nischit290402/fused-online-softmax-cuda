@@ -5,10 +5,12 @@ import sys
 PEAK_GBPS = 352.06              # theoretical peak, see results/env.txt
 USABLE_MIB = 7.5 * 1024         # usable GPU memory line in graph 2
 SIZES = [1024, 2048, 4096, 8192, 16384, 32768]
-ORDER = ['composed', 'torch.softmax', 'B1', 'B2', 'B3']
-COLORS = {'composed': '#2a78d6', 'torch.softmax': '#eb6834', 'B1': '#1baf7a',
-          'B2': '#eda100', 'B3': '#e87ba4'}
-MARKERS = {'composed': 'o', 'torch.softmax': 's', 'B1': '^', 'B2': 'D', 'B3': 'P'}
+# v1 kernels, then the version 2 kernels (csrc/softmax_kernels_v2.cu); the 8 colours are the validated palette in order
+ORDER = ['composed', 'torch.softmax', 'B1', 'B2', 'B3', 'B3v2', 'B4', 'B5']
+COLORS = {'composed': '#2a78d6', 'torch.softmax': '#eb6834', 'B1': '#1baf7a', 'B2': '#eda100',
+          'B3': '#e87ba4', 'B3v2': '#008300', 'B4': '#6250d6', 'B5': '#e34948'}
+MARKERS = {'composed': 'o', 'torch.softmax': 's', 'B1': '^', 'B2': 'D', 'B3': 'P', 'B3v2': 'X', 'B4': 'v', 'B5': '<'}
+V2_ONLY = ('B3v2', 'B4', 'B5')     # taken from results/v2 sweeps; torch.softmax and B2 come from the v1 sweeps
 MODEL_BYTES = {'composed': 16, 'B1': 8, 'B2': 6, 'B3': 4}   # idealized model, bytes per element
 INK, INK2, MUTED, GRID, SURFACE = '#0b0b0b', '#52514e', '#8a8984', '#e6e5e1', '#fcfcfb'
 
@@ -162,7 +164,7 @@ def _series(rows):
 
 
 def make_charts(sweep_csv: str, ncu_dir: str = 'results', sweep_csv2: str = None,
-                peak_gbps: float = PEAK_GBPS, out_dir: str = 'results') -> None:
+                peak_gbps: float = PEAK_GBPS, out_dir: str = 'results', v2_csvs=()) -> None:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -172,13 +174,17 @@ def make_charts(sweep_csv: str, ncu_dir: str = 'results', sweep_csv2: str = None
         if p:
             with open(p, newline='') as f:
                 rows += list(csv.DictReader(f))
+    for p in v2_csvs:
+        if p and os.path.exists(p):
+            with open(p, newline='') as f:
+                rows += [r for r in csv.DictReader(f) if r['variant'] in V2_ONLY]
     data = _series(rows)
     os.makedirs(out_dir, exist_ok=True)
     ticks = [str(s // 1024) + 'K' for s in SIZES]
 
     for fname, key, ylabel, title in (
             ('graph1_bandwidth.png', 'bw', 'Effective bandwidth (GB/s)',
-             'Softmax effective bandwidth, RTX 2070 Max-Q (fp16, block 256)'),
+             'Softmax effective bandwidth, RTX 2070 Max-Q (fp16, block 256; B3v2, B4, B5 from v2)'),
             ('graph2_memory.png', 'mem', 'Peak GPU memory above the input (MiB, log scale)',
              'Softmax peak memory above the input')):
         fig, ax = plt.subplots(figsize=(8.5, 5), dpi=150, facecolor=SURFACE)
@@ -204,10 +210,16 @@ def make_charts(sweep_csv: str, ncu_dir: str = 'results', sweep_csv2: str = None
                 continue
             # in the memory graph the fused kernels overlap, so draw larger markers first
             # and smaller ones on top; every series stays visible
-            ms = 6.5 if key == 'bw' else 13 - 2.4 * idx
+            ms = 6.5 if key == 'bw' else max(3.5, 13 - 1.4 * idx)
             ax.plot(xs, ys, color=COLORS[v], lw=2, marker=MARKERS[v], ms=ms,
                     markeredgecolor=SURFACE, markeredgewidth=1.2, label=v)
-            ends.setdefault((xs[-1], round(ys[-1], 1)), []).append(v)
+            # series that end within 3% of each other share one label ("B4 = B5") so labels never overlap
+            for (ex, ey), names in ends.items():
+                if ex == xs[-1] and abs(ey - ys[-1]) <= 0.03 * max(ey, ys[-1]):
+                    names.append(v)
+                    break
+            else:
+                ends[(xs[-1], ys[-1])] = [v]
         for (x_end, y_end), names in ends.items():
             ax.annotate(' = '.join(names), (x_end, y_end), xytext=(8, 0), textcoords='offset points',
                         va='center', fontsize=9, color=INK2)
@@ -229,7 +241,7 @@ def make_charts(sweep_csv: str, ncu_dir: str = 'results', sweep_csv2: str = None
         ax.set_ylabel(ylabel)
         ax.set_title(title, loc='left', fontsize=11, color=INK)
         ax.legend(frameon=False, fontsize=9, labelcolor=INK2, loc='upper center',
-                  bbox_to_anchor=(0.5, -0.15), ncol=5)
+                  bbox_to_anchor=(0.5, -0.15), ncol=4)
         fig.savefig(os.path.join(out_dir, fname), facecolor=SURFACE, bbox_inches='tight')
         plt.close(fig)
 
@@ -268,4 +280,5 @@ if __name__ == '__main__':
     for p in (run1, run2):
         if p:
             print(f"{p}: filled ncu columns in {fill_sweep_with_ncu(p)} rows")
-    make_charts(run1, 'results', run2)
+    make_charts(run1, 'results', run2,
+                v2_csvs=[os.path.join('results', 'v2', f'sweep_v2_run{i}.csv') for i in (1, 2)])

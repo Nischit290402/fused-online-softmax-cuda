@@ -13,9 +13,9 @@ from analyze import (INK, INK2, MUTED, PEAK_GBPS, SIZES, SURFACE, _style, dram_b
 
 OUT = os.path.join('results', 'v2')
 # order and colours checked with the palette validator: no two neighbours too close in hue
-ORDER = ['torch.softmax', 'B4', 'B2', 'B5', 'B3v2']
-COLORS = {'torch.softmax': '#eb6834', 'B4': '#2a78d6', 'B2': '#eda100', 'B5': '#6250d6', 'B3v2': '#e87ba4'}
-MARKERS = {'torch.softmax': 's', 'B4': 'o', 'B2': 'D', 'B5': 'v', 'B3v2': 'P'}
+ORDER = ['torch.softmax', 'B4', 'B2', 'B5', 'B3v2']   # adjacent pairs validated with these colours
+COLORS = {'torch.softmax': '#eb6834', 'B4': '#6250d6', 'B2': '#eda100', 'B5': '#e34948', 'B3v2': '#008300'}  # same as analyze.py
+MARKERS = {'torch.softmax': 's', 'B4': 'v', 'B2': 'D', 'B5': '<', 'B3v2': 'X'}   # same as analyze.py
 LABELS = {'torch.softmax': 'torch.softmax', 'B4': 'B4: 16-B loads, chunked (m, d)', 'B2': 'B2 (v1 kernel)',
           'B5': 'B5: one warp per row', 'B3v2': 'B3, widened block'}
 
@@ -48,6 +48,7 @@ def chart(v2, v1):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(8.5, 5), dpi=150, facecolor=SURFACE)
     _style(ax)
+    ends = {}
     for v in ORDER:
         pts = [(S, bw(S, mean(v2[(v, S, 256, 'expf')]['t']))) for S in SIZES
                if (v, S, 256, 'expf') in v2 and v2[(v, S, 256, 'expf')]['t']]
@@ -56,13 +57,20 @@ def chart(v2, v1):
         xs, ys = zip(*pts)
         ax.plot(xs, ys, color=COLORS[v], lw=2, marker=MARKERS[v], ms=6.5, markeredgecolor=SURFACE,
                 markeredgewidth=1.2, label=LABELS[v])
-        ax.annotate(v, (xs[-1], ys[-1]), xytext=(8, 0), textcoords='offset points', va='center',
+        for (ex, ey), names in ends.items():
+            if ex == xs[-1] and abs(ey - ys[-1]) <= 0.03 * max(ey, ys[-1]):
+                names.append(v)
+                break
+        else:
+            ends[(xs[-1], ys[-1])] = [v]
+    for (ex, ey), names in ends.items():
+        ax.annotate(' = '.join(names), (ex, ey), xytext=(8, 0), textcoords='offset points', va='center',
                     fontsize=9, color=INK2)
     pts = [(S, bw(S, mean(v1[('B3', S, 256, 'expf')]['t']))) for S in SIZES
            if ('B3', S, 256, 'expf') in v1 and v1[('B3', S, 256, 'expf')]['t']]
     if pts:
         xs, ys = zip(*pts)
-        ax.plot(xs, ys, color=COLORS['B3v2'], lw=1.6, ls='--', marker=MARKERS['B3v2'], ms=5,
+        ax.plot(xs, ys, color='#e87ba4', lw=1.6, ls='--', marker=MARKERS['B3v2'], ms=5,
                 markeredgecolor=SURFACE, label='B3, v1 launch (256 threads)')
     ax.axhline(PEAK_GBPS, color=MUTED, ls='--', lw=1.2)
     ax.text(SIZES[-1] * 2.5, PEAK_GBPS, f'theoretical peak {PEAK_GBPS:.0f} GB/s ', ha='right', va='bottom',
