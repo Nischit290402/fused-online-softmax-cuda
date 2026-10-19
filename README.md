@@ -139,7 +139,7 @@ Two self-contained pages live in [`docs/`](docs/). To serve them, enable GitHub 
 | `csrc/softmax_kernels_v2.cu`, `csrc/softmax_bindings_v2.cpp`, `ext_v2.py` | v2: B1/B2/B3 copied from v1, B3 launch fix, B4, B5, study notes; builds `fused_softmax_v2` into `build_v2/` |
 | `softmax.py` | Step A: scalar references, float64 oracle, `compare`, composed and torch versions, `bench`, baseline sweep |
 | `tests/test_ext.py` | v1: 10 cases × 3 variants × 4 block sizes (absolute, row-sum and relative checks), asserted `fast_exp` cases, B3 at the 48 KiB boundary, six inputs that must raise, timing |
-| `tests/test_ext_v2.py` | v2: 15 cases × 5 variants × 4 block sizes, including the 16-byte path and an unaligned input; B4/B5 against B2; the B3 block sizes |
+| `tests/test_ext_v2.py` | v2, 354 checks (all pass): 15 cases × 5 variants × 4 block sizes, including the 16-byte path and an unaligned input; `fast_exp` cases; B4/B5 against B2 (max difference 3.8e-6); the B3 block sizes and shared-memory boundary; five inputs that must raise |
 | `sweep.py`, `sweep_v2.py` | 40-cell and 37-cell timing sweeps (`forward` or `reverse` order) |
 | `profile_one*.py`, `run_ncu*.py` | one profiled call per cell; 15 v1 and 9 v2 Nsight Compute runs with DRAM read/write bytes and warp stall reasons |
 | `analyze.py`, `analyze_v2.py`, `make_readme_figures.py` | ncu CSV parser, graphs and tables |
@@ -156,7 +156,7 @@ From the x64 Native Tools Command Prompt for VS 2022, with a PyTorch 2.11 + CUDA
 set TORCH_CUDA_ARCH_LIST=7.5
 python softmax.py                         &:: Step A tests and results\baseline.csv
 python tests\test_ext.py                  &:: v1 extension
-python tests\test_ext_v2.py               &:: v2 extension
+python tests\test_ext_v2.py               &:: v2 extension, 354/354 checks
 
 :: second terminal, before each sweep:
 :: nvidia-smi --query-gpu=timestamp,clocks.sm,clocks.mem,temperature.gpu,power.draw --format=csv -lms 1000 -f results\gpu_clocks_run1.csv
