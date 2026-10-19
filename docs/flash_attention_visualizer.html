@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlashAttention Online Softmax</title>
+<meta name="description" content="Step through FlashAttention's tiled online softmax on a small example, see how it differs from the standalone softmax kernels in this repo, and estimate HBM traffic.">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f7f6f3; --surface: #fcfcfb; --surface-2: #f0efeb; --line: #e2e0da;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #8a8984;
+  --accent: #2a78d6; --accent-soft: #dce9fa;
+  --hbm: #eb6834; --hbm-soft: #fbe3d8; --sram: #1baf7a; --sram-soft: #d6f2e7;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #8f8e86;
+    --accent: #3987e5; --accent-soft: #1d3350;
+    --hbm: #d95926; --hbm-soft: #3d2419; --sram: #199e70; --sram-soft: #163a2d;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #8f8e86;
+  --accent: #3987e5; --accent-soft: #1d3350;
+  --hbm: #d95926; --hbm-soft: #3d2419; --sram: #199e70; --sram-soft: #163a2d;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--sans); }
+main { max-width: 1080px; margin: 0 auto; padding: 28px 16px 64px; }
+h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
+h2 { font-size: 18px; margin: 0 0 4px; }
+h3 { font-size: 14px; margin: 0 0 6px; color: var(--ink-2); font-weight: 600; }
+p.lede { color: var(--ink-2); margin: 0 0 22px; max-width: 780px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+.sub { color: var(--ink-2); margin: 0 0 14px; font-size: 14px; }
+.controls { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: end; margin-bottom: 14px; }
+label { font-size: 13px; color: var(--ink-2); display: flex; flex-direction: column; gap: 4px; }
+select { font: 14px var(--sans); padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); min-width: 110px; }
+input[type=range] { width: 220px; accent-color: var(--accent); }
+button { font: 600 13px var(--sans); padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .45; cursor: default; }
+code, .mono { font-family: var(--mono); font-size: 13px; }
+.flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0 4px; }
+.box { padding: 7px 10px; border-radius: 8px; font-size: 13px; border: 1px solid var(--line); background: var(--surface-2); }
+.box.hbm { background: var(--hbm-soft); border-color: var(--hbm); }
+.box.sram { background: var(--sram-soft); border-color: var(--sram); }
+.box.dim { opacity: .45; }
+.arr { color: var(--muted); font-size: 14px; }
+.flow-title { font-size: 13px; font-weight: 700; margin-top: 12px; }
+.legend { display: flex; gap: 16px; font-size: 12.5px; color: var(--ink-2); margin-top: 10px; flex-wrap: wrap; }
+.sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1px solid; }
+.mats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.mat { background: var(--surface-2); border-radius: 9px; padding: 10px; overflow-x: auto; }
+.mat table { border-collapse: collapse; font: 12px var(--mono); }
+.mat td { padding: 3px 6px; text-align: right; color: var(--ink); }
+.mat td.cur { background: var(--accent-soft); border-radius: 3px; }
+.mat td.past { color: var(--muted); }
+.mat td.fut { color: var(--line); }
+.kv { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 3px; margin: 6px 0 12px; }
+.kvc { height: 26px; border-radius: 5px; font: 11px var(--mono); display: grid; place-items: center; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); }
+.kvc.cur { background: var(--accent); color: #fff; border-color: var(--accent); }
+.kvc.past { background: var(--accent-soft); color: var(--ink-2); }
+.eq { background: var(--surface-2); border-radius: 9px; padding: 10px 12px; font: 12.5px/1.6 var(--mono); overflow-x: auto; white-space: pre; }
+.stat { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-top: 12px; }
+.stat div { background: var(--surface-2); border-radius: 9px; padding: 10px 12px; }
+.stat b { display: block; font: 700 18px var(--sans); }
+.stat span { font-size: 12.5px; color: var(--ink-2); }
+table.cmp { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+table.cmp th, table.cmp td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.cmp th { color: var(--ink-2); font-weight: 600; }
+.note { font-size: 13px; color: var(--ink-2); margin-top: 10px; }
+.ok { color: var(--sram); font-weight: 700; }
+footer { color: var(--muted); font-size: 12.5px; margin-top: 26px; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>How FlashAttention uses online softmax</h1>
+  <p class="lede">FlashAttention computes <code>O = softmax(QKᵀ / √d) V</code> without writing the N × N score matrix to HBM. It streams K and V tiles through on-chip memory and keeps a running max <code>m</code>, a running sum <code>l</code> and an unnormalized output <code>O</code> per query row. This is the same (m, d) rule as kernel B2 in this repo, applied per tile and fused with the matmuls.</p>
+
+  <section class="card">
+    <h2>1. What lives in HBM, and what this repo measures</h2>
+    <p class="sub">Orange boxes are N × N tensors written to or read from HBM (DRAM). Green boxes stay in registers or shared memory.</p>
+    <div class="flow-title">Standard attention (5+ kernels)</div>
+    <div class="flow"><span class="box">Q, K</span><span class="arr">→</span><span class="box hbm">S = QKᵀ (N×N)</span><span class="arr">→</span><span class="box hbm">P = softmax(S) (N×N)</span><span class="arr">→</span><span class="box">P·V</span><span class="arr">→</span><span class="box">O (N×d)</span></div>
+    <div class="flow-title">This repo (softmax only, S already in HBM)</div>
+    <div class="flow"><span class="box dim">Q, K</span><span class="arr">→</span><span class="box hbm">S (N×N), read 1 to 3 times</span><span class="arr">→</span><span class="box sram">one fused kernel: B1, B2 or B3</span><span class="arr">→</span><span class="box hbm">P (N×N), written once</span><span class="arr">→</span><span class="box dim">P·V</span></div>
+    <div class="flow-title">FlashAttention (1 kernel)</div>
+    <div class="flow"><span class="box">Q tile</span><span class="arr">+</span><span class="box">K, V tiles</span><span class="arr">→</span><span class="box sram">S tile, P tile, running m, l, O in SRAM</span><span class="arr">→</span><span class="box">O (N×d) and logsumexp (N)</span></div>
+    <div class="legend"><span><i class="sw" style="background:var(--hbm-soft);border-color:var(--hbm)"></i>N × N tensor in HBM</span><span><i class="sw" style="background:var(--sram-soft);border-color:var(--sram)"></i>on chip</span></div>
+    <div class="note">The kernels here remove passes over S, but S and P still cross DRAM. Their memory stays O(N²) (2,048 MiB above the input at N = 32,768). FlashAttention's O(N) memory comes from never creating S and P, which this lab does not attempt.</div>
+  </section>
+
+  <section class="card">
+    <h2>2. Step through the tiled online softmax</h2>
+    <p class="sub">Example: one query block of B<sub>r</sub> = 4 rows, N = 12 keys, head dim d = 4, key tile B<sub>c</sub> = 4, so 3 tiles. Values come from a fixed random seed. The page checks the result against exact attention computed in float64.</p>
+    <div class="controls">
+      <button id="prev">Previous tile</button>
+      <button id="next" class="primary">Next tile</button>
+      <button id="reset">Reset</button>
+      <span class="mono" id="stepLbl"></span>
+    </div>
+    <h3>Key / value columns (tile j highlighted)</h3>
+    <div class="kv" id="kv"></div>
+    <div class="mats">
+      <div class="mat"><h3>S<sub>j</sub> = Q K<sub>j</sub>ᵀ / √d (4 × 4)</h3><div id="S"></div></div>
+      <div class="mat"><h3>running m (row max)</h3><div id="m"></div></div>
+      <div class="mat"><h3>running l (row sum of exp)</h3><div id="l"></div></div>
+      <div class="mat"><h3>unnormalized O (4 × d)</h3><div id="O"></div></div>
+    </div>
+    <div class="eq" id="eq" style="margin-top:14px"></div>
+    <div class="stat" id="faStats"></div>
+  </section>
+
+  <section class="card">
+    <h2>3. Per tile or per element: where B2 and FlashAttention differ</h2>
+    <table class="cmp">
+      <tr><th></th><th>B2 in this repo</th><th>FlashAttention</th></tr>
+      <tr><td>Unit of the (m, d) update</td><td>one element: <code>md_combine((x, 1), md)</code></td><td>one tile of B<sub>c</sub> keys: tile max, then exp of the tile</td></tr>
+      <tr><td>exp calls per score, first pass</td><td>2 (both sides of <code>md_combine</code>)</td><td>1, plus 1 rescale per row per tile</td></tr>
+      <tr><td>What is accumulated</td><td>the normalizer d only</td><td>d and the output <code>O = Σ exp(s − m)·v</code></td></tr>
+      <tr><td>Second pass over the scores</td><td>needed: y = exp(x − m)/d needs the final m and d</td><td>none: O is rescaled by exp(m<sub>old</sub> − m<sub>new</sub>) and divided by l once at the end</td></tr>
+      <tr><td>DRAM bytes per score (fp16)</td><td>6 (measured 6.00 at N = 16,384)</td><td>0 for S and P (they never leave the chip)</td></tr>
+      <tr><td>Kept for the backward pass</td><td>nothing</td><td>logsumexp L = m + log l, 4 bytes per row</td></tr>
+    </table>
+    <div class="controls" style="margin-top:14px">
+      <label>Row length N<select id="xN"><option>2048</option><option selected>8192</option><option>16384</option></select></label>
+      <label>Tile width Bc<select id="xBc"><option>32</option><option selected>64</option><option>128</option></select></label>
+    </div>
+    <div class="stat" id="expStats"></div>
+  </section>
+
+  <section class="card">
+    <h2>4. HBM traffic estimate for one attention head</h2>
+    <p class="sub">Counts fp16 elements moved, using the loop order of FlashAttention-2 (outer loop over query blocks, so K and V are read N / B<sub>r</sub> times). These are formulas, not measurements: real kernels add caching effects and extra terms.</p>
+    <div class="controls">
+      <label>Sequence length N<select id="hN"><option>1024</option><option>2048</option><option selected>4096</option><option>8192</option><option>16384</option><option>32768</option></select></label>
+      <label>Head dim d<select id="hd"><option selected>64</option><option>128</option></select></label>
+      <label>Query block Br<select id="hBr"><option>64</option><option selected>128</option></select></label>
+    </div>
+    <div class="stat" id="hbmStats"></div>
+    <div class="eq" id="hbmEq" style="margin-top:12px"></div>
+  </section>
+
+  <footer>Part of <a href="https://github.com/Nischit290402/fused-online-softmax-cuda">fused-online-softmax-cuda</a>. References: Milakov and Gimelshein (arXiv 1805.02867), Dao et al. FlashAttention (arXiv 2205.14135), Dao FlashAttention-2 (arXiv 2307.08691).</footer>
+</main>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const Br = 4, N = 12, d = 4, Bc = 4, T = N / Bc, scale = 1 / Math.sqrt(d);
+  function rng(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+  function normal(r) { const u = Math.max(r(), 1e-12), v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  const r = rng(2024);
+  const mk = (rows, cols) => Array.from({ length: rows }, () => Array.from({ length: cols }, () => normal(r) * 1.5));
+  const Q = mk(Br, d), K = mk(N, d), V = mk(N, d);
+  const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
+
+  // exact reference in float64
+  const ref = Q.map((q) => {
+    const s = K.map((k) => dot(q, k) * scale);
+    const mx = Math.max(...s);
+    const e = s.map((x) => Math.exp(x - mx));
+    const l = e.reduce((a, b) => a + b, 0);
+    return Array.from({ length: d }, (_, c) => e.reduce((acc, p, j) => acc + p * V[j][c], 0) / l);
+  });
+
+  // precompute the state after each tile: states[t] = state after t tiles
+  const states = [];
+  let m = Array(Br).fill(-Infinity), l = Array(Br).fill(0), O = Array.from({ length: Br }, () => Array(d).fill(0));
+  states.push({ m: m.slice(), l: l.slice(), O: O.map((x) => x.slice()), S: null, alpha: null, exps: 0 });
+  let exps = 0;
+  for (let t = 0; t < T; t++) {
+    const S = Q.map((q) => K.slice(t * Bc, (t + 1) * Bc).map((k) => dot(q, k) * scale));
+    const alpha = [];
+    const mNew = m.map((mo, i) => Math.max(mo, ...S[i]));
+    for (let i = 0; i < Br; i++) {
+      const a = m[i] === -Infinity ? 0 : Math.exp(m[i] - mNew[i]);   // rescale factor, 0 on the first tile
+      if (m[i] !== -Infinity) exps++;
+      alpha.push(a);
+      const P = S[i].map((x) => Math.exp(x - mNew[i]));
+      exps += Bc;
+      l[i] = a * l[i] + P.reduce((x, y) => x + y, 0);
+      for (let c = 0; c < d; c++) O[i][c] = a * O[i][c] + P.reduce((acc, p, jj) => acc + p * V[t * Bc + jj][c], 0);
+    }
+    m = mNew;
+    states.push({ m: m.slice(), l: l.slice(), O: O.map((x) => x.slice()), S, alpha, exps });
+  }
+
+  let step = 0;
+  const f2 = (x) => (x === -Infinity ? '-inf' : x.toFixed(2));
+  const tbl = (rows, cls) => '<table>' + rows.map((row) => '<tr>' + row.map((x) => '<td class="' + (cls || '') + '">' + f2(x) + '</td>').join('') + '</tr>').join('') + '</table>';
+
+  function render() {
+    const st = states[step];
+    $('stepLbl').textContent = step === 0 ? 'before tile 0: m = -inf, l = 0, O = 0' : 'after tile ' + (step - 1) + ' of ' + (T - 1);
+    $('prev').disabled = step === 0;
+    $('next').disabled = step === T;
+    $('kv').innerHTML = Array.from({ length: N }, (_, j) => {
+      const tile = Math.floor(j / Bc);
+      const cls = step > 0 && tile === step - 1 ? 'cur' : (tile < step - 1 ? 'past' : '');
+      return '<div class="kvc ' + cls + '" title="key/value ' + j + ', tile ' + tile + '">k' + j + '</div>';
+    }).join('');
+    $('S').innerHTML = st.S ? tbl(st.S, 'cur') : '<div class="note">no tile loaded yet</div>';
+    $('m').innerHTML = tbl(st.m.map((x) => [x]));
+    $('l').innerHTML = tbl(st.l.map((x) => [x]));
+    $('O').innerHTML = tbl(st.O);
+    if (step === 0) {
+      $('eq').textContent = 'Each step loads one K/V tile into SRAM and updates every query row i:\n' +
+        '  m_new = max(m_old, rowmax(S_j))\n  alpha = exp(m_old - m_new)          (rescale factor, 1 exp per row)\n' +
+        '  l     = alpha * l + rowsum(exp(S_j - m_new))\n  O     = alpha * O + exp(S_j - m_new) @ V_j\nAt the end: O = O / l, and logsumexp = m + log(l) is stored for the backward pass.';
+    } else {
+      const i = 0, prev = states[step - 1];
+      $('eq').textContent = 'Row 0, tile ' + (step - 1) + ':\n' +
+        '  m_new = max(' + f2(prev.m[i]) + ', rowmax = ' + f2(Math.max(...st.S[i])) + ') = ' + f2(st.m[i]) + '\n' +
+        '  alpha = ' + (prev.m[i] === -Infinity ? 'exp(-inf) = 0 (first tile, nothing to rescale)' : 'exp(' + f2(prev.m[i]) + ' - ' + f2(st.m[i]) + ') = ' + st.alpha[i].toFixed(4)) + '\n' +
+        '  l     = ' + st.alpha[i].toFixed(4) + ' x ' + f2(prev.l[i]) + ' + rowsum(exp(S_j - m_new)) = ' + f2(st.l[i]) + '\n' +
+        '  O     = alpha x O_old + exp(S_j - m_new) @ V_j     (shown in the O panel)';
+    }
+    let stats = '<div><b>' + st.exps + '</b><span>exp calls so far (' + (step * Bc * Br) + ' scores seen)</span></div>' +
+      '<div><b>0</b><span>scores or probabilities written to HBM</span></div>';
+    if (step === T) {
+      const final = st.O.map((row, i) => row.map((x) => x / st.l[i]));
+      let err = 0;
+      final.forEach((row, i) => row.forEach((x, c) => { err = Math.max(err, Math.abs(x - ref[i][c])); }));
+      stats += '<div><b class="ok">' + err.toExponential(1) + '</b><span>max |O / l − exact softmax(QKᵀ/√d)V|. The tiled result is exact, not an approximation.</span></div>';
+      $('O').innerHTML = tbl(st.O) + '<div class="note">O / l (final output):</div>' + tbl(final);
+    }
+    $('faStats').innerHTML = stats;
+  }
+  $('next').onclick = () => { if (step < T) { step++; render(); } };
+  $('prev').onclick = () => { if (step > 0) { step--; render(); } };
+  $('reset').onclick = () => { step = 0; render(); };
+
+  // section 3
+  function renderExp() {
+    const n = +$('xN').value, bc = +$('xBc').value;
+    const b1 = 2 * n, b2 = 3 * n, fa = n + n / bc;
+    const fmt = (x) => Math.round(x).toLocaleString();
+    $('expStats').innerHTML =
+      '<div><b>' + fmt(b1) + '</b><span>B1: exp per row (pass 2 and pass 3)</span></div>' +
+      '<div><b>' + fmt(b2) + '</b><span>B2: 2 per element in pass 1, 1 in pass 2</span></div>' +
+      '<div><b>' + fmt(fa) + '</b><span>FlashAttention: N + N/B<sub>c</sub> rescales, single pass</span></div>' +
+      '<div><b>' + fmt(n + n / 4 + n) + '</b><span>B2 with the per-8-element update from the code review: 8 exps per chunk + 2 in md_combine, then pass 2</span></div>';
+  }
+  ['xN', 'xBc'].forEach((id) => $(id).onchange = renderExp);
+
+  // section 4
+  function human(elems) {
+    const b = elems * 2;
+    if (b >= 2 ** 30) return (b / 2 ** 30).toFixed(2) + ' GiB';
+    if (b >= 2 ** 20) return (b / 2 ** 20).toFixed(1) + ' MiB';
+    return (b / 2 ** 10).toFixed(0) + ' KiB';
+  }
+  function renderHbm() {
+    const n = +$('hN').value, dd = +$('hd').value, br = +$('hBr').value;
+    const std = 2 * n * dd + n * n + n * n + n * n + n * n + n * dd + n * dd;   // read Q,K; write S; read S; write P; read P; read V; write O
+    const tr = n / br;
+    const fa = n * dd + 2 * n * dd * tr + n * dd + 2 * n;                         // read Q; read K,V Tr times; write O; write logsumexp (fp32 = 2 fp16 units)
+    $('hbmStats').innerHTML =
+      '<div><b>' + human(std) + '</b><span>standard attention</span></div>' +
+      '<div><b>' + human(fa) + '</b><span>FlashAttention-2 loop order</span></div>' +
+      '<div><b>' + (std / fa).toFixed(1) + '×</b><span>less HBM traffic</span></div>' +
+      '<div><b>' + human(2 * n * n) + '</b><span>extra memory for S and P that FlashAttention never allocates</span></div>';
+    $('hbmEq').textContent =
+      'standard = 2Nd (read Q, K) + N² (write S) + N² (read S) + N² (write P) + N² (read P) + Nd (read V) + Nd (write O)\n' +
+      'flash    = Nd (read Q) + 2Nd x N/Br (read K, V once per query block) + Nd (write O) + N (logsumexp)\n' +
+      'N = ' + n.toLocaleString() + ', d = ' + dd + ', Br = ' + br + ', N/Br = ' + tr + ' query blocks';
+  }
+  ['hN', 'hd', 'hBr'].forEach((id) => $(id).onchange = renderHbm);
+
+  render(); renderExp(); renderHbm();
+})();
+</script>
+</body>
+</html>

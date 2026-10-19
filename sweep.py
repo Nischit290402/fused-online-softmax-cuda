@@ -56,6 +56,26 @@ def count_kernels(fn, x) -> int:
         torch.cuda.synchronize()
     return sum(1 for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA)
 
+_KPC = {}
+
+
+def kernels_per_call(m, cell: dict, x) -> int:
+    # filled by count_all_variants() at the start of the sweep
+    if cell['variant'] not in _KPC:
+        _KPC[cell['variant']] = count_kernels(make_fn(m, cell), x)
+    return _KPC[cell['variant']]
+
+
+def count_all_variants(m, cells) -> None:
+    # torch.profiler stops recording CUDA kernels once a session has profiled a long call (S >= 16384):
+    # the earlier sweeps logged 0 and 4 instead of 1 and 5 from that cell on. The count does not
+    # depend on S, so take it once per variant on a small input before any timing.
+    x = make_input(1024, 0)
+    for cell in cells:
+        if cell['variant'] not in _KPC:
+            _KPC[cell['variant']] = count_kernels(make_fn(m, cell), x)
+    del x
+    print('kernels per call:', _KPC)
 
 def warm_up_gpu(seconds: float = 6.0) -> None:
     # The GPU idles at 300 MHz and needs about 5 s of load to reach its working clocks.
@@ -100,7 +120,7 @@ def run_cell(m, cell: dict) -> dict:
     try:
         x = make_input(cell['S'], 0)
         fn = make_fn(m, cell)
-        row['kernels_per_call'] = count_kernels(fn, x)
+        row['kernels_per_call'] = kernels_per_call(m, cell, x)
         # small S means calls of 60 to 600 us, so use more warm-up and more timed runs
         warmup, iters = (50, 200) if cell['S'] <= 4096 else (10, 50)
         if cell['S'] <= 4096:
@@ -121,6 +141,7 @@ def run_sweep(order: str, out_csv: str) -> None:
     if order == 'reverse':
         cells = cells[::-1]
     m = ext.build()
+    count_all_variants(m, cells)
     warm_up_gpu()
     os.makedirs(os.path.dirname(out_csv) or '.', exist_ok=True)
     with open(out_csv, 'w', newline='') as f:

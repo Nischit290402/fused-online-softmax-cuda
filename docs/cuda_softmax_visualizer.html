@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA Softmax Visualizer</title>
+<meta name="description" content="Interactive view of how the fused softmax kernels map rows to blocks, elements to threads, and reduce with warp shuffles, plus an occupancy calculator for the RTX 2070 Max-Q.">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f7f6f3; --surface: #fcfcfb; --surface-2: #f0efeb; --line: #e2e0da;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #8a8984;
+  --accent: #2a78d6; --accent-soft: #dce9fa;
+  --w0: #2a78d6; --w1: #eb6834; --w2: #1baf7a; --w3: #eda100;
+  --w4: #e87ba4; --w5: #008300; --w6: #6250d6; --w7: #e34948;
+  --good: #1baf7a; --warn: #c98500;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #8f8e86;
+    --accent: #3987e5; --accent-soft: #1d3350;
+    --w0: #3987e5; --w1: #d95926; --w2: #199e70; --w3: #c98500;
+    --w4: #d55181; --w5: #008300; --w6: #9085e9; --w7: #e66767;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #8f8e86;
+  --accent: #3987e5; --accent-soft: #1d3350;
+  --w0: #3987e5; --w1: #d95926; --w2: #199e70; --w3: #c98500;
+  --w4: #d55181; --w5: #008300; --w6: #9085e9; --w7: #e66767;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--sans); }
+main { max-width: 1080px; margin: 0 auto; padding: 28px 16px 64px; }
+h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
+h2 { font-size: 18px; margin: 0 0 4px; }
+p.lede { color: var(--ink-2); margin: 0 0 22px; max-width: 760px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+.sub { color: var(--ink-2); margin: 0 0 14px; font-size: 14px; }
+.controls { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: end; margin-bottom: 14px; }
+label { font-size: 13px; color: var(--ink-2); display: flex; flex-direction: column; gap: 4px; max-width: 100%; }
+select, input[type=number] { max-width: 100%; font: 14px var(--sans); padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); min-width: 110px; }
+input[type=range] { width: 220px; accent-color: var(--accent); }
+button { font: 600 13px var(--sans); padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .45; cursor: default; }
+code, .mono { font-family: var(--mono); font-size: 13px; }
+.grid-blocks { display: flex; flex-wrap: wrap; gap: 6px; }
+.blk { width: 54px; height: 38px; border-radius: 7px; border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2); font: 12px var(--mono); display: grid; place-items: center; cursor: pointer; }
+.blk.sel { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); font-weight: 700; }
+.row-cells { display: grid; gap: 2px; }
+.cell { height: 22px; border-radius: 3px; font: 9px var(--mono); display: grid; place-items: center; color: #fff; opacity: .28; transition: opacity .15s, transform .15s; }
+.cell.on { opacity: 1; transform: translateY(-2px); }
+.cell.done { opacity: .62; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--ink-2); margin-top: 10px; }
+.sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.stat { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 12px; }
+.stat div { background: var(--surface-2); border-radius: 9px; padding: 10px 12px; }
+.stat b { display: block; font: 700 18px var(--sans); color: var(--ink); }
+.stat span { font-size: 12.5px; color: var(--ink-2); }
+.lanes { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 3px; }
+.lane { border-radius: 5px; background: var(--surface-2); border: 1px solid var(--line); text-align: center; padding: 4px 0; font: 10px var(--mono); color: var(--ink-2); position: relative; }
+.lane b { display: block; font: 700 11px var(--mono); color: var(--ink); }
+.lane.pair { border-color: var(--accent); background: var(--accent-soft); }
+.lane.final { border-color: var(--good); }
+#arrows { width: 100%; height: 60px; display: block; }
+.note { font-size: 13px; color: var(--ink-2); margin-top: 10px; }
+.code { background: var(--surface-2); border-radius: 9px; padding: 10px 12px; font: 12.5px/1.5 var(--mono); white-space: pre; overflow-x: auto; color: var(--ink); }
+.code .hl { background: var(--accent-soft); border-radius: 3px; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--ink-2); font-weight: 600; }
+td.lim { font-weight: 700; color: var(--warn); }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); font-size: 12px; color: var(--ink-2); }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 760px) { #arrows { display: none; } .cell { font-size: 8px; } .two { grid-template-columns: 1fr; } .lanes { grid-template-columns: repeat(16, minmax(0, 1fr)); } .lane { font-size: 9px; } }
+footer { color: var(--muted); font-size: 12.5px; margin-top: 26px; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>How the fused softmax kernels use the GPU</h1>
+  <p class="lede">The launch is <code>grid = rows, block = threads</code>: block <code>b</code> owns row <code>b</code>, and thread <code>t</code> walks that row with a stride of <code>blockDim.x</code>. Then the warps reduce with shuffles, and the block reduces through shared memory. Use the toy controls to watch one row, then try real sizes in the occupancy calculator at the bottom.</p>
+
+  <section class="card">
+    <h2>1. Grid: one block per row</h2>
+    <p class="sub">A score matrix with <span id="rowsLbl"></span> rows launches <span id="rowsLbl2"></span> blocks. Click a block to pick its row.</p>
+    <div class="controls">
+      <label>Rows (toy)<select id="rows"><option>4</option><option selected>8</option><option>16</option></select></label>
+      <label>Row length N (toy)<select id="N"><option>64</option><option selected>200</option><option>320</option><option>512</option></select></label>
+      <label>Threads per block<select id="T"><option>32</option><option selected>64</option><option>128</option></select></label>
+    </div>
+    <div class="grid-blocks" id="blocks"></div>
+  </section>
+
+  <section class="card">
+    <h2>2. Block: threads walk the row with a stride</h2>
+    <p class="sub">Each color is one warp (32 threads). In iteration <code>k</code>, thread <code>t</code> reads element <code>t + k·blockDim.x</code>. Neighbouring lanes read neighbouring addresses, so each warp load is one coalesced 64-byte request.</p>
+    <div class="controls">
+      <label>Loop iteration k <input type="range" id="iter" min="0" max="3" value="0"></label>
+      <button id="iterPlay" class="primary">Play</button>
+      <label>Load width<select id="vec"><option value="1" selected>scalar __half (2 B per thread)</option><option value="8">uint4 (8 halves, 16 B per thread)</option></select></label>
+    </div>
+    <div class="row-cells" id="cells"></div>
+    <div class="legend" id="warpLegend"></div>
+    <div class="stat" id="iterStats"></div>
+  </section>
+
+  <section class="card">
+    <h2>3. Warp reduction with <code>__shfl_xor_sync</code></h2>
+    <p class="sub">Every lane holds its partial result. At each step, lane <code>i</code> swaps with lane <code>i ^ offset</code> and keeps the combined value. After 5 steps (offsets 16, 8, 4, 2, 1), all 32 lanes hold the same result, with no shared memory and no <code>__syncthreads</code>.</p>
+    <div class="controls">
+      <label>Operation<select id="op"><option value="max">max (B1 pass 1)</option><option value="sum">sum (B1 pass 2)</option><option value="md">(m, d) combine (B2)</option></select></label>
+      <button id="shStep" class="primary">Next step</button>
+      <button id="shReset">Reset</button>
+      <span class="pill" id="shState"></span>
+    </div>
+    <svg id="arrows" aria-hidden="true"></svg>
+    <div class="lanes" id="lanes"></div>
+    <div class="two" style="margin-top:14px">
+      <div class="code" id="shCode"></div>
+      <div>
+        <div class="note" id="shNote"></div>
+        <div class="note"><b>Across warps:</b> lane 0 of each warp writes its result to <code>smem[warp]</code>, then <code>__syncthreads()</code>, then every warp reads <code>smem[lane]</code> for <code>lane &lt; warps</code> and runs the same 5-step shuffle again. Every thread ends with the block result, so the early <code>return</code> for an all -inf row is taken by the whole block together.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>4. DRAM passes per kernel</h2>
+    <p class="sub">The same row, read by the three kernels. The idealized traffic counts 2 bytes per access and assumes no L2 hits.</p>
+    <div class="controls">
+      <label>Kernel<select id="kern"><option value="b1">B1: safe softmax, 3 passes</option><option value="b2" selected>B2: online (m, d), 2 passes</option><option value="b3">B3: row cached in shared memory</option><option value="comp">composed PyTorch, 5 kernels</option></select></label>
+    </div>
+    <div id="passes"></div>
+  </section>
+
+  <section class="card">
+    <h2>5. Occupancy calculator, RTX 2070 Max-Q (sm_75)</h2>
+    <p class="sub">Limits per SM: 1,024 threads, 16 blocks, 64 KiB shared memory, 65,536 registers, and 36 SMs. This reproduces the <code>launch__occupancy_limit_*</code> values from Nsight Compute in this repo.</p>
+    <div class="controls">
+      <label>Kernel<select id="okern"><option value="b1">B1 (22 regs)</option><option value="b2">B2 (24 regs)</option><option value="b3" selected>B3 (20 regs + row in smem)</option><option value="torchw">torch softmax_warp_forward (80 regs, 128 threads)</option></select></label>
+      <label>S (rows = row length)<select id="oS"><option>1024</option><option>2048</option><option>4096</option><option>8192</option><option selected>16384</option><option>32768</option></select></label>
+      <label>Threads per block<select id="oT"><option>128</option><option selected>256</option><option>512</option><option>1024</option></select></label>
+    </div>
+    <table id="occ"></table>
+    <div class="stat" id="occStats"></div>
+    <div class="note" id="occNote"></div>
+  </section>
+
+  <footer>Part of <a href="https://github.com/Nischit290402/fused-online-softmax-cuda">fused-online-softmax-cuda</a>. Hardware limits are read from the Nsight Compute device attributes in <code>results/ncu_*.csv</code>.</footer>
+</main>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const WARP_VARS = ['--w0', '--w1', '--w2', '--w3', '--w4', '--w5', '--w6', '--w7'];
+  const cssVar = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const state = { rows: 8, N: 200, T: 64, sel: 0, iter: 0, vec: 1 };
+
+  // ---- section 1 and 2 ----
+  function renderBlocks() {
+    $('rowsLbl').textContent = state.rows;
+    $('rowsLbl2').textContent = state.rows;
+    const box = $('blocks');
+    box.innerHTML = '';
+    for (let b = 0; b < state.rows; b++) {
+      const d = document.createElement('button');
+      d.className = 'blk' + (b === state.sel ? ' sel' : '');
+      d.textContent = 'blk ' + b;
+      d.title = 'blockIdx.x = ' + b + ' owns row ' + b + ' (offset = ' + b + ' x N)';
+      d.onclick = () => { state.sel = b; renderBlocks(); renderCells(); };
+      box.appendChild(d);
+    }
+  }
+
+  function iterations() { return Math.ceil(state.N / (state.T * state.vec)); }
+
+  function renderCells() {
+    const N = state.N, T = state.T, vec = state.vec;
+    const cols = Math.min(window.innerWidth < 760 ? 32 : 64, N);
+    const cells = $('cells');
+    cells.style.gridTemplateColumns = 'repeat(' + cols + ', minmax(0, 1fr))';
+    cells.innerHTML = '';
+    const it = Math.min(state.iter, iterations() - 1);
+    for (let j = 0; j < N; j++) {
+      const unit = Math.floor(j / vec);            // which load unit this element belongs to
+      const t = unit % T, k = Math.floor(unit / T);
+      const warp = Math.floor(t / 32);
+      const c = document.createElement('div');
+      c.className = 'cell' + (k === it ? ' on' : (k < it ? ' done' : ''));
+      c.style.background = cssVar(WARP_VARS[warp % 8]);
+      c.textContent = (j % vec === 0) ? t : '';
+      c.title = 'element ' + j + '  read by thread ' + t + ' (warp ' + warp + ', lane ' + (t % 32) + ') in iteration ' + k +
+                '\naddress = x + (' + state.sel + ' x N + ' + j + ') x 2 bytes';
+      cells.appendChild(c);
+    }
+    const warps = Math.ceil(T / 32);
+    $('warpLegend').innerHTML = Array.from({ length: warps }, (_, w) =>
+      '<span><i class="sw" style="background:' + cssVar(WARP_VARS[w % 8]) + '"></i>warp ' + w + ' = threads ' + (w * 32) + '-' + (w * 32 + 31) + '</span>').join('') +
+      '<span>cell label = threadIdx.x</span>';
+    const iters = iterations();
+    $('iter').max = iters - 1;
+    const bytesPerWarpLoad = 32 * 2 * vec;
+    $('iterStats').innerHTML =
+      stat(iters, 'loop iterations per thread (ceil(N / (blockDim.x x ' + vec + ')))') +
+      stat(bytesPerWarpLoad + ' B', 'bytes per warp load instruction') +
+      stat(Math.ceil(N / vec / 32), 'warp load instructions for this row, per pass') +
+      stat('blk ' + state.sel, 'block shown (row ' + state.sel + ')');
+  }
+  function stat(v, s) { return '<div><b>' + v + '</b><span>' + s + '</span></div>'; }
+
+  let timer = null;
+  $('iterPlay').onclick = () => {
+    if (timer) { clearInterval(timer); timer = null; $('iterPlay').textContent = 'Play'; return; }
+    $('iterPlay').textContent = 'Pause';
+    timer = setInterval(() => {
+      state.iter = (state.iter + 1) % iterations();
+      $('iter').value = state.iter;
+      renderCells();
+    }, 700);
+  };
+  $('iter').oninput = (e) => { state.iter = +e.target.value; renderCells(); };
+  $('vec').onchange = (e) => { state.vec = +e.target.value; state.iter = 0; $('iter').value = 0; renderCells(); };
+  ['rows', 'N', 'T'].forEach((id) => $(id).onchange = (e) => {
+    state[id] = +e.target.value; state.sel = Math.min(state.sel, state.rows - 1); state.iter = 0; $('iter').value = 0;
+    renderBlocks(); renderCells();
+  });
+
+  // ---- section 3: warp shuffle ----
+  const OFFSETS = [16, 8, 4, 2, 1];
+  let sh = null;
+  function rng(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+  function shInit() {
+    const r = rng(7), op = $('op').value;
+    const vals = [];
+    for (let i = 0; i < 32; i++) {
+      const x = Math.round((r() * 8 - 4) * 10) / 10;
+      vals.push(op === 'md' ? { m: x, d: Math.round((1 + r() * 3) * 10) / 10 } : x);
+    }
+    sh = { op, step: 0, vals, start: vals.slice() };
+    renderShuffle();
+  }
+  function combine(op, a, b) {
+    if (op === 'max') return Math.max(a, b);
+    if (op === 'sum') return a + b;
+    if (a.m === -Infinity && b.m === -Infinity) return { m: -Infinity, d: 0 };
+    const m = Math.max(a.m, b.m);
+    return { m, d: a.d * Math.exp(a.m - m) + b.d * Math.exp(b.m - m) };
+  }
+  function fmt(v) {
+    if (typeof v === 'number') return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1);
+    return v.m.toFixed(1) + '|' + (v.d >= 100 ? v.d.toFixed(0) : v.d.toFixed(1));
+  }
+  function renderShuffle() {
+    const lanes = $('lanes');
+    lanes.innerHTML = '';
+    const off = sh.step < 5 ? OFFSETS[sh.step] : null;
+    for (let i = 0; i < 32; i++) {
+      const d = document.createElement('div');
+      d.className = 'lane' + (off !== null && i < 32 ? ' pair' : '') + (sh.step === 5 ? ' final' : '');
+      d.innerHTML = '<b>' + fmt(sh.vals[i]) + '</b>L' + i;
+      d.title = off !== null ? 'lane ' + i + ' exchanges with lane ' + (i ^ off) : 'lane ' + i;
+      if (off !== null && i % (2 * off) >= off) d.classList.remove('pair');
+      lanes.appendChild(d);
+    }
+    drawArrows(off);
+    $('shState').textContent = sh.step < 5 ? 'next: offset ' + off + ' (step ' + (sh.step + 1) + ' of 5)' : 'done: every lane holds the warp result';
+    $('shStep').disabled = sh.step >= 5;
+    const fnName = sh.op === 'md' ? 'warp_reduce_md' : (sh.op === 'max' ? 'warp_reduce_max' : 'warp_reduce_sum');
+    const body = sh.op === 'md'
+      ? ['float nbor_x = __shfl_xor_sync(0xffffffffu, v.x, laneMask);', 'float nbor_y = __shfl_xor_sync(0xffffffffu, v.y, laneMask);', 'v = md_combine(v, make_float2(nbor_x, nbor_y));']
+      : [sh.op === 'max' ? 'float nbor = __shfl_xor_sync(0xffffffff, v, laneMask);' : 'v += __shfl_xor_sync(0xffffffff, v, laneMask);', sh.op === 'max' ? 'v = fmaxf(v, nbor);' : ''];
+    $('shCode').innerHTML = '__device__ ' + (sh.op === 'md' ? 'float2' : 'float') + ' ' + fnName + '(' + (sh.op === 'md' ? 'float2' : 'float') + ' v) {\n' +
+      '    int laneMask = 16;\n    while (laneMask > 0) {   <span class="hl">// laneMask = ' + (off === null ? 'done' : off) + '</span>\n' +
+      body.filter(Boolean).map((l) => '        ' + l).join('\n') + '\n        laneMask >>= 1;\n    }\n    return v;\n}';
+    const exact = sh.start.reduce((a, b) => combine(sh.op, a, b));
+    $('shNote').innerHTML = sh.op === 'md'
+      ? 'Each cell shows <code>m|d</code>. When two partial maxima differ, the smaller side\'s <code>d</code> is multiplied by <code>exp(m_small - m_big)</code>. Exact result over the 32 lanes: <code>' + fmt(exact) + '</code>.'
+      : 'Exact ' + sh.op + ' of the 32 starting values: <code>' + fmt(exact) + '</code>. ' + (sh.step === 5 ? 'Every lane matches it.' : 'Step until every lane matches it.');
+  }
+  function drawArrows(off) {
+    const svg = $('arrows');
+    const w = svg.clientWidth || 1000, h = 60;
+    svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    const cols = window.matchMedia('(max-width: 760px)').matches ? 16 : 32;
+    if (off === null || cols === 16) { svg.innerHTML = ''; return; }
+    const cw = w / 32;
+    let s = '';
+    for (let i = 0; i < 32; i++) {
+      const j = i ^ off;
+      if (j < i) continue;
+      const x1 = cw * i + cw / 2, x2 = cw * j + cw / 2;
+      const top = Math.max(6, h - 8 - (x2 - x1) * 0.12);
+      s += '<path d="M' + x1 + ' ' + (h - 2) + ' C ' + x1 + ' ' + top + ', ' + x2 + ' ' + top + ', ' + x2 + ' ' + (h - 2) + '" fill="none" stroke="' + cssVar('--accent') + '" stroke-width="1.6" opacity="0.8"/>';
+    }
+    svg.innerHTML = s;
+  }
+  $('shStep').onclick = () => {
+    const off = OFFSETS[sh.step];
+    const prev = sh.vals.slice();
+    sh.vals = prev.map((v, i) => combine(sh.op, v, prev[i ^ off]));
+    sh.step++;
+    renderShuffle();
+  };
+  $('shReset').onclick = shInit;
+  $('op').onchange = shInit;
+  window.addEventListener('resize', () => sh && drawArrows(sh.step < 5 ? OFFSETS[sh.step] : null));
+
+  // ---- section 4: passes ----
+  const PASSES = {
+    b1: { rows: [['Pass 1', 'read x from DRAM', 'thread max, then block_reduce_max gives m', 2], ['Pass 2', 'read x from DRAM again', 'sum of exp(x - m), then block_reduce_sum gives d', 2], ['Pass 3', 'read x a third time, write y', 'y = exp(x - m) / d', 4]], model: 8, measured: '4.12 at S = 8192 (row stays in L2), 7.99 at S = 16384' },
+    b2: { rows: [['Pass 1', 'read x from DRAM', 'online (m, d) per thread, md_combine across warps and the block', 2], ['Pass 2', 'read x again, write y', 'y = exp(x - m) / d', 4]], model: 6, measured: '4.15 at S = 8192, 6.00 at S = 16384' },
+    b3: { rows: [['Pass 1', 'read x from DRAM, copy it into shared memory', 'online (m, d), block reduction', 2], ['Pass 2', 'read the row from shared memory (no DRAM), write y', 'y = exp(x - m) / d', 2]], model: 4, measured: '3.99 at S = 8192, 4.00 at S = 16384, but 25% occupancy at 16384' },
+    comp: { rows: [['amax', 'read x', 'write m (1 per row)', 2], ['x - m', 'read x', 'write s', 4], ['exp', 'read s', 'write e', 4], ['sum', 'read e', 'write d (1 per row)', 2], ['e / d', 'read e', 'write y', 4]], model: 16, measured: '15.94 at S = 8192' },
+  };
+  function renderPasses() {
+    const k = PASSES[$('kern').value];
+    $('passes').innerHTML = '<table><tr><th>Step</th><th>DRAM traffic</th><th>Work</th><th>Bytes / element</th></tr>' +
+      k.rows.map((r) => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td><td>' + r[2] + '</td><td class="mono">' + r[3] + '</td></tr>').join('') +
+      '<tr><th>Total (model)</th><th></th><th></th><th class="mono">' + k.model + '</th></tr></table>' +
+      '<div class="note">Measured by Nsight Compute in this repo: ' + k.measured + ' bytes per element.</div>';
+  }
+  $('kern').onchange = renderPasses;
+
+  // ---- section 5: occupancy ----
+  const SM = { threads: 1024, blocks: 16, smem: 65536, regs: 65536, count: 36 };
+  const KERN = { b1: { regs: 22, smemStatic: 128 }, b2: { regs: 24, smemStatic: 256 }, b3: { regs: 20, smemStatic: 256 }, torchw: { regs: 80, smemStatic: 0 } };
+  function renderOcc() {
+    const kname = $('okern').value, S = +$('oS').value;
+    let T = +$('oT').value;
+    const k = KERN[kname];
+    const rowsPerBlock = kname === 'torchw' ? 4 : 1;
+    if (kname === 'torchw') { T = 128; $('oT').value = '128'; $('oT').disabled = true; } else { $('oT').disabled = false; }
+    const dyn = kname === 'b3' ? 2 * S : 0;
+    const smemPerBlock = Math.ceil((dyn + k.smemStatic) / 256) * 256;   // shared memory is allocated in 256 B units
+    const warpsPerBlock = Math.ceil(T / 32);
+    const regsPerWarp = Math.ceil(k.regs * 32 / 256) * 256;            // registers are allocated per warp in units of 256
+    const byThreads = Math.floor(SM.threads / T);
+    const byRegs = Math.floor(SM.regs / (regsPerWarp * warpsPerBlock));
+    const other = Math.min(byThreads, SM.blocks, byRegs);
+    // sm_75 runs with a 32 KiB or a 64 KiB shared-memory carveout; the driver picks the smaller one that does not
+    // cost occupancy, and Nsight Compute reports the shared-memory limit for that carveout
+    let bySmem = Infinity;
+    if (smemPerBlock > 0) {
+      bySmem = Math.floor(32768 / smemPerBlock) >= other ? Math.floor(32768 / smemPerBlock) : Math.floor(SM.smem / smemPerBlock);
+    }
+    const lim = {
+      'threads (1,024 per SM)': byThreads,
+      'blocks (16 per SM)': SM.blocks,
+      'registers (65,536 per SM)': byRegs,
+      'shared memory (32 or 64 KiB carveout)': bySmem,
+    };
+    const fits = !(kname === 'b3' && dyn + k.smemStatic > 65536);
+    const blocks = fits ? Math.min(...Object.values(lim)) : 0;
+    const occ = blocks * warpsPerBlock / 32 * 100;
+    const minKey = Object.keys(lim).find((key) => lim[key] === blocks);
+    $('occ').innerHTML = '<tr><th>Limit</th><th>Blocks per SM it allows</th></tr>' + Object.entries(lim).map(([key, v]) =>
+      '<tr><td>' + key + '</td><td class="' + (key === minKey && fits ? 'lim' : '') + '">' + (v === Infinity ? 'no limit' : v) + (key === minKey && fits ? '  (binding)' : '') + '</td></tr>').join('');
+    const blocksTotal = S / rowsPerBlock;
+    $('occStats').innerHTML = fits
+      ? stat(blocks, 'resident blocks per SM') + stat(occ.toFixed(0) + '%', 'theoretical occupancy (warps / 32)') +
+        stat((blocksTotal / (SM.count * blocks)).toFixed(2), 'waves = blocks / (36 SMs x blocks per SM)') +
+        stat(smemPerBlock.toLocaleString() + ' B', 'shared memory per block')
+      : stat('does not fit', 'row of ' + (2 * S).toLocaleString() + ' B + 256 B scratch > 65,536 B opt-in limit (sweep status skip_smem)');
+    let note = '';
+    if (kname === 'b3' && fits && occ < 100) {
+      const need = Math.max(32, Math.min(1024, Math.floor(1024 / Math.max(1, blocks) / 32) * 32));
+      const occNeed = Math.min(100, blocks * need / 1024 * 100);
+      note = 'Shared memory caps B3 at ' + blocks + ' block(s) per SM. With ' + need + ' threads per block the same ' + blocks +
+             ' block(s) would give ' + occNeed.toFixed(0) + '% occupancy. torch\'s cunn_SoftMaxForwardSmem uses 1,024 threads per block at S = 16384.';
+    } else if (kname === 'torchw') {
+      note = 'One warp per row, 4 rows per block, the whole row in registers. 80 registers per thread cap it at 6 blocks (24 warps), which is the 75% that Nsight Compute reports at S = 2048.';
+    }
+    $('occNote').textContent = note;
+  }
+  ['okern', 'oS', 'oT'].forEach((id) => $(id).onchange = renderOcc);
+
+  renderBlocks(); renderCells(); shInit(); renderPasses(); renderOcc();
+})();
+</script>
+</body>
+</html>

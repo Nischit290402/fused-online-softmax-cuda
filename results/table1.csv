@@ -1,6 +1,6 @@
-variant,S,kernels_per_call,dram_bytes_per_elem,model_bytes_per_elem,dram_pct_peak,sm_pct_peak,l2_hit_pct,occupancy_pct,regs_per_thread,time_us_ncu
-composed,8192,5,15.94,16,53.77,44.06,39.32,93.19,33.0,5663.4
-torch.softmax,8192,1,3.99,,35.07,57.28,50.03,98.15,35.0,2169.9
-B1,8192,1,4.12,8,24.72,34.36,71.38,97.81,22.0,3190.0
-B2,8192,1,4.15,6,27.04,48.35,63.71,97.82,24.0,2928.0
-B3,8192,1,3.99,4,28.35,58.08,50.04,73.97,20.0,2684.6
+variant,S,block,kernels_per_call,dram_bytes_per_elem,model_bytes_per_elem,dram_pct_peak,sm_pct_peak,l2_hit_pct,occupancy_pct,regs_per_thread,time_us_ncu,dram_bytes_source,top_stalls
+composed,8192,256,5,15.94,16,53.73,44.02,39.33,93.32,33.0,5668.9,read+write,long_scoreboard 10.48; wait 2.13; not_selected 1.15
+torch.softmax,8192,256,1,3.99,,35.09,57.32,50.04,98.07,35.0,2167.4,read+write,not_selected 3.27; math_pipe_throttle 2.11; wait 1.97
+B1,8192,256,1,4.12,8,24.63,34.42,71.24,97.47,22.0,3194.1,read+write,long_scoreboard 15.56; wait 2.20; not_selected 1.01
+B2,8192,256,1,4.12,6,27.0,48.66,64.06,97.99,24.0,2913.5,read+write,long_scoreboard 10.04; wait 1.81; not_selected 1.10
+B3,8192,256,1,3.99,4,28.35,58.15,50.03,73.93,20.0,2683.4,read+write,long_scoreboard 4.44; wait 1.86; selected 1.00

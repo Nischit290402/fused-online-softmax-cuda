@@ -13,11 +13,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from analyze import (COLORS, INK, INK2, MARKERS, MODEL_BYTES, MUTED, PEAK_GBPS, SIZES, SURFACE,
-                     _style, dram_bytes_per_elem, ncu_path, parse_ncu_csv)
+                     _style, dram_bytes_per_elem, ncu_path, parse_ncu_csv, top_stalls)
 
 FUSED = ['torch.softmax', 'B1', 'B2', 'B3']
 ALL = ['composed'] + FUSED
 NCU_S = [2048, 8192, 16384]
+NCU_CELLS = [(2048, 256), (8192, 256), (8192, 512), (16384, 256)]
 
 
 def load_sweeps(paths):
@@ -45,12 +46,12 @@ def spread_pct(v):
 def ncu_table():
     out = {}
     for v in ALL:
-        for S in NCU_S:
-            p = ncu_path('results', v, S)
+        for S, block in NCU_CELLS:
+            p = ncu_path('results', v, S, block)
             if os.path.exists(p):
                 d = parse_ncu_csv(p)
                 d['bpe'] = dram_bytes_per_elem(d, S)
-                out[(v, S)] = d
+                out[(v, S) if block == 256 else (v, S, block)] = d
     return out
 
 
@@ -158,16 +159,18 @@ def tables(cells, ncu):
         row.append(f"{best / bws['torch.softmax'] * 100:.0f}%")
         L.append('| ' + ' | '.join(row) + ' |')
     L.append('\n### Table C. Nsight Compute (ncu time is at locked base clocks, so it is slower than Table A)\n')
-    L.append('| variant | S | kernels/call | DRAM B/elem | model B/elem | L2 hit % | DRAM % peak | SM % peak | occupancy % | regs/thread | time (µs) |')
-    L.append('|---|---|---|---|---|---|---|---|---|---|---|')
+    stalls = any(d.get('stalls') for d in ncu.values())
+    L.append('| variant | S | block | kernels/call | DRAM B/elem | model B/elem | L2 hit % | DRAM % peak | SM % peak | occupancy % | regs/thread | time (µs) |'
+             + (' top stall reasons (warps per issue) |' if stalls else ''))
+    L.append('|---|---|---|---|---|---|---|---|---|---|---|---|' + ('---|' if stalls else ''))
     for v in ALL:
-        for S in NCU_S:
-            d = ncu.get((v, S))
+        for S, block in NCU_CELLS:
+            d = ncu.get((v, S) if block == 256 else (v, S, block))
             if not d:
                 continue
-            L.append(f"| {v} | {S:,} | {d['n_kernels']} | {d['bpe']:.2f} | {MODEL_BYTES.get(v, 4 if v == 'torch.softmax' else '')} | "
+            L.append(f"| {v} | {S:,} | {block} | {d['n_kernels']} | {d['bpe']:.2f} | {MODEL_BYTES.get(v, 4 if v == 'torch.softmax' else '')} | "
                      f"{d['l2_hit_pct']:.0f} | {d['dram_pct_peak']:.0f} | {d['sm_pct_peak']:.0f} | {d['occupancy_pct']:.0f} | "
-                     f"{d['regs_per_thread']:.0f} | {d['time_us']:,.0f} |")
+                     f"{d['regs_per_thread']:.0f} | {d['time_us']:,.0f} |" + (f" {top_stalls(d)} |" if stalls else ''))
     L.append('\n### Table D. Peak GPU memory above the input (MiB)\n')
     L.append('| S | input | composed | torch.softmax, B1, B2, B3 |')
     L.append('|---|---|---|---|')

@@ -7,6 +7,8 @@ from math import inf, exp
 import numpy as np
 import torch
 
+flush = torch.empty(16 * 2 ** 20, dtype=torch.uint8, device='cuda')  # 4x the 4 MiB L2
+
 def softmax_safe_3pass(row: list[float])->list[float]:
     m = -inf
     for r in row:
@@ -68,7 +70,8 @@ def bench(fn, x: torch.Tensor, warmup=10, iters=50)->dict:
     for _ in range(warmup):
         fn(x)
     torch.cuda.synchronize()
-
+    buffer_size = 16 * 1024 * 1024
+    buffer = bytearray(buffer_size)
     base = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
 
@@ -76,6 +79,7 @@ def bench(fn, x: torch.Tensor, warmup=10, iters=50)->dict:
     end = torch.cuda.Event(enable_timing=True)
     times = []
     for _ in range(iters):
+        flush.zero_()
         start.record()
         fn(x)
         end.record()

@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 #include <math.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -37,6 +38,7 @@ __device__ float  block_reduce_max(float v, float* smem) {
     int idx = warp; // the first lane of each warp will have the warp reduced value so can always just take that
     // for each thread<=>lane we have to perform warp reduce
     float val = warp_reduce_max(v);
+    __syncthreads();
     if (lane==0) smem[idx] = val;
     __syncthreads();
     int warps = blockDim.x / 32;
@@ -103,6 +105,7 @@ __device__ float2 block_reduce_md(float2 v, float2* smem) {
     int lane = threadIdx.x % 32;
     int idx = warp;
     float2 val = warp_reduce_md<FAST_EXP>(v);
+    __syncthreads();
     if (lane==0) smem[idx] = val;
     __syncthreads();
     int warps = blockDim.x / 32;
@@ -199,6 +202,8 @@ int64_t max_smem_optin();   // defined at the end of the file, used by softmax_f
 
 // ---- called from Python ----
 torch::Tensor softmax_forward(torch::Tensor x, int64_t variant, int64_t block, bool fast_exp) {
+    const c10::cuda::CUDAGuard guard(x.device());
+
     TORCH_CHECK(variant >= 0 && variant <= 2, "variant must be 0, 1 or 2");
     CHECK_INPUT(x, at::kHalf);
     TORCH_CHECK(x.dim() == 2, "x must be 2-D (rows, N)");
@@ -234,12 +239,12 @@ torch::Tensor softmax_forward(torch::Tensor x, int64_t variant, int64_t block, b
         TORCH_CHECK(bytes + scratch <= max_smem_optin(),
                     "variant 2: row does not fit in shared memory");
         if (fast_exp) {
-            if (bytes > 48 * 1024)
+            if (bytes + scratch > 48 * 1024)
                 C10_CUDA_CHECK(cudaFuncSetAttribute(softmax_b3_kernel<true>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
             softmax_b3_kernel<true><<<grid, blk, bytes, stream>>>(x_ptr, y_ptr, N);
         } else {
-            if (bytes > 48 * 1024)
+            if (bytes + scratch > 48 * 1024)
                 C10_CUDA_CHECK(cudaFuncSetAttribute(softmax_b3_kernel<false>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
             softmax_b3_kernel<false><<<grid, blk, bytes, stream>>>(x_ptr, y_ptr, N);
@@ -248,10 +253,11 @@ torch::Tensor softmax_forward(torch::Tensor x, int64_t variant, int64_t block, b
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
+
 int64_t max_smem_optin() {
     int dev;
-    cudaGetDevice(&dev);
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
     int v;
-    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
     return v;
 }

@@ -5,3 +5,4 @@ __pycache__/
 *.obj
 *.exe
 build/
+build_v2/

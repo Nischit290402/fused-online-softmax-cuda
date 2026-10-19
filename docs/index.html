@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fused Softmax Visualizers</title>
+<style>
+:root { color-scheme: light; --bg: #f7f6f3; --surface: #fcfcfb; --line: #e2e0da; --ink: #0b0b0b; --ink-2: #52514e; --accent: #2a78d6; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { color-scheme: dark; --bg: #121211; --surface: #1a1a19; --line: #34332f; --ink: #f0efec; --ink-2: #c3c2b7; --accent: #3987e5; } }
+:root[data-theme="dark"] { color-scheme: dark; --bg: #121211; --surface: #1a1a19; --line: #34332f; --ink: #f0efec; --ink-2: #c3c2b7; --accent: #3987e5; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 40px 16px; }
+a.card { display: block; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin: 14px 0; color: var(--ink); text-decoration: none; }
+a.card:hover { border-color: var(--accent); }
+a.card b { color: var(--accent); font-size: 17px; }
+p { color: var(--ink-2); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Fused online softmax in CUDA: visualizers</h1>
+  <p>Companion pages for <a href="https://github.com/Nischit290402/fused-online-softmax-cuda">fused-online-softmax-cuda</a>, measured on an RTX 2070 Max-Q (sm_75).</p>
+  <a class="card" href="cuda_softmax_visualizer.html"><b>Grid, blocks, threads and warp shuffles</b><p>How one row maps to one block, how threads stride through it, how the 5-step shuffle reduction works, and an occupancy calculator that reproduces the Nsight Compute limits.</p></a>
+  <a class="card" href="flash_attention_visualizer.html"><b>FlashAttention's tiled online softmax</b><p>Step through the running max, running sum and rescaled output on a small example, see where it differs from the B2 kernel, and estimate HBM traffic.</p></a>
+</main>
+</body>
+</html>

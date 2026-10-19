@@ -16,8 +16,9 @@ TIME_SCALE = {'second': 1.0, 'msecond': 1e-3, 'usecond': 1e-6, 'nsecond': 1e-9}
 BYTE_SCALE = {'byte': 1.0, 'Kbyte': 1e3, 'Mbyte': 1e6, 'Gbyte': 1e9}
 
 
-def ncu_path(ncu_dir: str, variant: str, S: int) -> str:
-    return os.path.join(ncu_dir, f"ncu_{variant.replace('.', '_')}_{S}.csv")
+def ncu_path(ncu_dir: str, variant: str, S: int, block: int = 256) -> str:
+    suffix = '' if block == 256 else f'_b{block}'
+    return os.path.join(ncu_dir, f"ncu_{variant.replace('.', '_')}_{S}{suffix}.csv")
 
 
 def _num(text):
@@ -32,6 +33,8 @@ def parse_ncu_csv(path: str) -> dict:
     percentages are averaged with the kernel time as weight."""
     with open(path, newline='', encoding='utf-8', errors='replace') as f:
         lines = f.read().splitlines()
+    # some copies of the file come back with every line wrapped in an extra layer of quotes
+    lines = [ln[1:-1].replace('""', '"') if ln.startswith('"""') else ln for ln in lines]
     start = next((i for i, ln in enumerate(lines) if ln.lstrip().startswith('"ID"')), None)
     if start is None:
         raise ValueError(f"{path}: no ncu CSV header found (no counter access, or the run failed)")
@@ -67,6 +70,14 @@ def parse_ncu_csv(path: str) -> dict:
     occ = column(['sm__warps_active.avg.pct_of_peak_sustained_active'])
     l2 = column(['lts__t_sector_hit_rate.pct'])
     regs = column(['launch__registers_per_thread'])
+    # WarpStateStats: average warps stalled per issued instruction, by reason (only in files profiled with it)
+    stalls = {}
+    for name in header:
+        if name.startswith('smsp__average_warps_issue_stalled_') and name.endswith('_per_issue_active.ratio'):
+            v = column([name])
+            if v is not None and None not in v:
+                reason = name[len('smsp__average_warps_issue_stalled_'):-len('_per_issue_active.ratio')]
+                stalls[reason] = sum(a * w for a, w in zip(v, secs)) / total_s
 
     def total(v):
         return None if v is None or None in v else sum(v)
@@ -81,7 +92,13 @@ def parse_ncu_csv(path: str) -> dict:
             'dram_total_bytes': (total(read) + total(write)) if total(read) is not None and total(write) is not None else total_bytes,
             'dram_pct_peak': wmean(dram), 'sm_pct_peak': wmean(sm),
             'occupancy_pct': wmean(occ), 'l2_hit_pct': wmean(l2),
-            'regs_per_thread': max(regs) if regs and None not in regs else None}
+            'regs_per_thread': max(regs) if regs and None not in regs else None,
+            'stalls': stalls}
+
+
+def top_stalls(parsed: dict, k: int = 3) -> str:
+    s = sorted(parsed.get('stalls', {}).items(), key=lambda kv: -kv[1])[:k]
+    return '; '.join(f'{r} {v:.2f}' for r, v in s)
 
 
 def dram_bytes_per_elem(parsed: dict, S: int) -> float:
@@ -93,14 +110,14 @@ def _fmt(v, digits=2):
 
 
 def fill_sweep_with_ncu(sweep_csv: str, ncu_dir: str = 'results') -> int:
-    """Write the Nsight columns into the sweep rows that have an ncu file (block 256, expf)."""
+    """Write the Nsight columns into the sweep rows that have an ncu file (expf rows, any block)."""
     with open(sweep_csv, newline='') as f:
         rd = csv.DictReader(f)
         fields, rows = rd.fieldnames, list(rd)
     n = 0
     for r in rows:
-        p = ncu_path(ncu_dir, r['variant'], int(r['S']))
-        if r['status'] != 'ok' or int(r['block']) != 256 or r['exp_impl'] != 'expf' or not os.path.exists(p):
+        p = ncu_path(ncu_dir, r['variant'], int(r['S']), int(r['block']))
+        if r['status'] != 'ok' or r['exp_impl'] != 'expf' or not os.path.exists(p):
             continue
         d = parse_ncu_csv(p)
         r['dram_read_bytes'] = _fmt(d['dram_read_bytes'], 0)
@@ -219,19 +236,21 @@ def make_charts(sweep_csv: str, ncu_dir: str = 'results', sweep_csv2: str = None
     # Table 1 (S = 8192) and a summary of every ncu file
     summary, table1 = [], []
     for v in ORDER:
-        for S in (2048, 8192, 16384):
-            p = ncu_path(ncu_dir, v, S)
+        for S, block in ((2048, 256), (8192, 256), (8192, 512), (16384, 256)):
+            p = ncu_path(ncu_dir, v, S, block)
             if not os.path.exists(p):
                 continue
             d = parse_ncu_csv(p)
-            line = {'variant': v, 'S': S, 'kernels_per_call': d['n_kernels'],
+            line = {'variant': v, 'S': S, 'block': block, 'kernels_per_call': d['n_kernels'],
                     'dram_bytes_per_elem': _fmt(dram_bytes_per_elem(d, S)),
                     'model_bytes_per_elem': MODEL_BYTES.get(v, ''),
                     'dram_pct_peak': _fmt(d['dram_pct_peak']), 'sm_pct_peak': _fmt(d['sm_pct_peak']),
                     'l2_hit_pct': _fmt(d['l2_hit_pct']), 'occupancy_pct': _fmt(d['occupancy_pct']),
-                    'regs_per_thread': _fmt(d['regs_per_thread'], 0), 'time_us_ncu': _fmt(d['time_us'], 1)}
+                    'regs_per_thread': _fmt(d['regs_per_thread'], 0), 'time_us_ncu': _fmt(d['time_us'], 1),
+                    'dram_bytes_source': 'read+write' if d['dram_read_bytes'] is not None else 'rate x time',
+                    'top_stalls': top_stalls(d)}
             summary.append(line)
-            if S == 8192:
+            if S == 8192 and block == 256:
                 table1.append(line)
     for name, lines in (('ncu_summary.csv', summary), ('table1.csv', table1)):
         if lines:

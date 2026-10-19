@@ -6,10 +6,16 @@ import sys
 
 from analyze import ncu_path
 
-SECTIONS = ['SpeedOfLight', 'MemoryWorkloadAnalysis', 'Occupancy', 'LaunchStats']
-# the doc's 10 runs, plus B3 at the same three sizes
-RUNS = ([(v, S) for v in ('torch.softmax', 'B1', 'B2', 'B3') for S in (2048, 8192, 16384)]
-        + [('composed', 8192)])
+# SpeedOfLight: DRAM and SM % of peak. MemoryWorkloadAnalysis: L2 hit rate, DRAM rate.
+# Occupancy and LaunchStats: occupancy limits, registers, shared memory. WarpStateStats: why warps stall.
+SECTIONS = ['SpeedOfLight', 'MemoryWorkloadAnalysis', 'Occupancy', 'LaunchStats', 'WarpStateStats']
+# exact DRAM bytes, split into reads and writes (the sections above only give a rate)
+METRICS = ['dram__bytes_read.sum', 'dram__bytes_write.sum']
+
+# (variant, S, block): the doc's 10 runs, B3 at the same sizes, and B1/B2 at block 512,
+# the fastest block size in the sweep, to test the L2 explanation for it
+RUNS = ([(v, S, 256) for v in ('torch.softmax', 'B1', 'B2', 'B3') for S in (2048, 8192, 16384)]
+        + [('composed', 8192, 256), ('B1', 8192, 512), ('B2', 8192, 512)])
 
 
 def find_ncu() -> str:
@@ -33,22 +39,28 @@ def find_ncu() -> str:
                      "If it is not installed, install Nsight Compute from NVIDIA.")
 
 
-def ncu_cmd(variant: str, S: int, out_csv: str) -> list:
+def ncu_cmd(variant: str, S: int, block: int, out_csv: str) -> list:
     cmd = [find_ncu(), '--profile-from-start', 'off', '--page', 'raw', '--csv',
            '--print-units', 'base', '--log-file', out_csv]
     for sec in SECTIONS:
         cmd += ['--section', sec]
-    return cmd + [sys.executable, 'profile_one.py', variant, str(S)]
+    cmd += ['--metrics', ','.join(METRICS)]
+    return cmd + [sys.executable, 'profile_one.py', variant, str(S), str(block)]
 
 
 def main() -> None:
+    # python run_ncu.py                    all runs in RUNS
+    # python run_ncu.py B1 8192 [block]    one run
     os.makedirs('results', exist_ok=True)
     print('using', find_ncu())
-    runs = [(sys.argv[1], int(sys.argv[2]))] if len(sys.argv) == 3 else RUNS
-    for variant, S in runs:
-        out_csv = ncu_path('results', variant, S)
-        cmd = ncu_cmd(variant, S, out_csv)
-        print(f"[{variant} S={S}] {' '.join(cmd)}")
+    if len(sys.argv) >= 3:
+        runs = [(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else 256)]
+    else:
+        runs = RUNS
+    for variant, S, block in runs:
+        out_csv = ncu_path('results', variant, S, block)
+        cmd = ncu_cmd(variant, S, block, out_csv)
+        print(f"[{variant} S={S} block={block}] {' '.join(cmd)}")
         rc = subprocess.run(cmd).returncode
         print(f"  exit code {rc}, report: {out_csv}")
         if rc != 0:
